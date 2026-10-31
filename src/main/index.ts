@@ -86,6 +86,7 @@ import { performance } from 'node:perf_hooks';
 import { createStartupTiming, installStartupTiming, markStartup, STARTUP_STATE } from './startup-timing.js';
 import { loadConnectorIdentity } from './connector-identity.js';
 import { initControlApiPath, shutdownControlApi, startControlApi } from './control-api.js';
+import { startOpenAiGateway, stopOpenAiGateway } from './openai-gateway/wire.js';
 import { restoreRequestCorrelations } from './session/correlation.js';
 import { restoreBlockedChats } from './session/blocked-chats.js';
 import { restoreTrustedChats } from './session/trusted-chats.js';
@@ -791,6 +792,11 @@ void app.whenReady().then(async () => {
   if (getConfig().controlApi.enabled) {
     startControlApi().catch((error: Error) => logWarn(`control API did not start: ${error.message}`));
   }
+  // SCGC: the OpenAI-compatible gateway listens on 0.0.0.0:PORT inside this
+  // process, next to the loopback-only control API. Fail-closed: without
+  // GATEWAY_API_KEY it refuses every /v1/* request and /health says so.
+  void startOpenAiGateway({ userData, log: (line) => logInfo(`openai gateway: ${line}`) }).catch((error: Error) =>
+    logError(`OpenAI gateway did not start: ${error.message}`));
   if (getConfig().ui.autoConnect) void connect();
   void resumeUpdateRefresh().catch((error: Error) => logWarn(`update refresh did not resume: ${error.message}`));
 
@@ -863,7 +869,7 @@ app.on('will-quit', (event) => {
       {
         name: 'admission/drain',
         budgetMs: 40_000,
-        run: () => [shutdownConnection(), shutdownBridge(), shutdownControlApi(), stopAgentRuntimeGc()]
+        run: () => [shutdownConnection(), shutdownBridge(), shutdownControlApi(), stopOpenAiGateway(), stopAgentRuntimeGc()]
       },
       // Phase 2: only after request handlers are done may their owned child processes go.
       {

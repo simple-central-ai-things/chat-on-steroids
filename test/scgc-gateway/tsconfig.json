@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["../../src/main/openai-gateway/**/*.ts", "./**/*.ts"],
+  // The two files that import CoS's own modules are checked by the app
+  // tsconfig (npm run typecheck), not by this standalone config.
+  "exclude": [
+    "../../src/main/openai-gateway/internals.ts",
+    "../../src/main/openai-gateway/wire.ts"
+  ]
+}

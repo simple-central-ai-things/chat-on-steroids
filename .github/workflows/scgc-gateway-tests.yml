@@ -1,0 +1,47 @@
+name: scgc-gateway-tests
+
+# The OpenAI-compatible gateway module and its offline tests live on the
+# scgc/* branches only; main is the untouched upstream tree.
+
+on:
+  push:
+    branches: ["scgc/**"]
+  pull_request:
+    branches: ["scgc/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scgc-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gateway:
+    name: Gateway typecheck and offline tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pinned toolchain
+        run: npm ci --no-audit --no-fund
+
+      # App-tree typecheck: covers src/main/openai-gateway/internals.ts and
+      # wire.ts against CoS's real exports (the files the standalone test
+      # config excludes).
+      - name: Typecheck the app tree
+        run: npx tsc --noEmit -p tsconfig.json
+
+      # Standalone config: the pure gateway modules plus the node:test suite.
+      - name: Typecheck the gateway tests
+        run: npx tsc --noEmit -p test/scgc-gateway/tsconfig.json
+
+      - name: Compile and run the offline gateway tests
+        run: |
+          npx tsc -p test/scgc-gateway/tsconfig.build.json
+          node --test "test/scgc-gateway/.build/test/scgc-gateway/*.test.js"

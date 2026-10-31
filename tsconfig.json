@@ -19,5 +19,9 @@
     "noEmit": true,
     "types": ["node", "electron-vite/node"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "electron.vite.config.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "electron.vite.config.ts"],
+  // The SCGC gateway tests run under their own NodeNext config and the
+  // node:test runner (see test/scgc-gateway/ and the scgc-gateway-tests
+  // workflow); they are not part of the app typecheck.
+  "exclude": ["test/scgc-gateway"]
 }
