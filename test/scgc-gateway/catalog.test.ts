@@ -41,10 +41,17 @@ test('an explicit model + effort is validated against the catalog', () => {
   });
 });
 
-test('an omitted effort defaults to the model\'s first offered level', () => {
+test('an omitted effort forwards null — the page confirms the model on any offered lane', () => {
+  // Defaulting to efforts[0] is unsafe: the picker refuses some exact
+  // (model, effort) pairs (measured live: gpt-6 + "none" failed
+  // model-unconfirmed while gpt-6 + "medium" confirmed).
   assert.deepEqual(resolveModelChoice(ready, 'gpt-5.1', null), {
     model: 'gpt-5.1',
-    reasoningEffort: 'minimal'
+    reasoningEffort: null
+  });
+  assert.deepEqual(resolveModelChoice(ready, 'gpt-5.1', undefined), {
+    model: 'gpt-5.1',
+    reasoningEffort: null
   });
 });
 

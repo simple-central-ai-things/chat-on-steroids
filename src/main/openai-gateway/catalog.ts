@@ -78,7 +78,13 @@ export interface ModelSelection {
 /**
  * Validate an OpenAI {model, reasoning_effort} pair against the catalog, as
  * control-actions.ts chosenModel() does: model and effort always travel
- * together; an omitted effort defaults to the model's first offered level.
+ * together; an omitted effort is forwarded as null — "confirm this model on
+ * whatever lane the picker offers", exactly CoS's composer auto lane.
+ *
+ * The first offered effort is NOT a safe default: the page refuses to
+ * confirm some account lanes by their exact (model, effort) pair (measured:
+ * gpt-6 + "none" fails model-unconfirmed while gpt-6 + "medium" confirms),
+ * so defaulting to efforts[0] would break every effort-less client request.
  *
  * No model in the request means "let ChatGPT keep its own selection" (both
  * null), the same as CoS's composer.
@@ -99,9 +105,8 @@ export function resolveModelChoice(
   if (choice === undefined) {
     throw new GatewayError(400, 'model_unknown', 'GET /v1/models lists the models this account offers');
   }
-  const selected = effort ?? choice.efforts[0];
-  if (selected === undefined || !choice.efforts.includes(selected)) {
+  if (effort !== undefined && effort !== null && !choice.efforts.includes(effort)) {
     throw new GatewayError(400, 'effort_unavailable', choice.id + ' offers ' + choice.efforts.join(', '));
   }
-  return { model: choice.id, reasoningEffort: selected };
+  return { model: choice.id, reasoningEffort: effort ?? null };
 }
