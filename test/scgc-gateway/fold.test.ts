@@ -114,3 +114,15 @@ test('the conversation key honors an override and requires a user message', () =
     /at least one user message/,
   );
 });
+
+test('an oversized system context is truncated to fit, keeping the user text whole', () => {
+  const bigSystem = 'x'.repeat(MAX_TEXT); // larger than the whole budget
+  const normalized = normalizeMessages([
+    { role: 'system', content: bigSystem },
+    { role: 'user', content: 'Tell me more' }
+  ]);
+  const text = foldFirst(normalized, true);
+  assert.ok(text.length <= MAX_TEXT, 'folded text must respect the ceiling');
+  assert.ok(text.startsWith(`${CONTEXT_MARKER}\n`), 'context marker kept');
+  assert.ok(text.endsWith('Tell me more'), 'user text preserved whole');
+});

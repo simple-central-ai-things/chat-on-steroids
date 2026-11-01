@@ -98,7 +98,14 @@ function checkText(text: string): string {
   return text;
 }
 
-/** What goes out as the first message of a new chat. */
+/** What goes out as the first message of a new chat.
+ *
+ * The client's system context is capped so the combined text never exceeds
+ * CoS's admission ceiling: the user text is always preserved whole, and an
+ * oversized context (e.g. a harness's full agent system prompt) is truncated
+ * to fit. Without this, a large system prompt blew past CoS's 96k ceiling and
+ * the send was refused with a too_big 502.
+ */
 export function foldFirst(
   normalized: readonly NormalizedMessage[],
   includeSystem: boolean,
@@ -107,7 +114,15 @@ export function foldFirst(
   if (!includeSystem) return userText;
   const context = systemText(normalized);
   if (context === null) return userText;
-  return `${CONTEXT_MARKER}\n${context.trim()}\n\n${userText}`;
+  const prefix = `${CONTEXT_MARKER}\n`;
+  const suffix = `\n\n${userText}`;
+  const budget = MAX_TEXT - prefix.length - suffix.length;
+  const ctx = context.trim();
+  if (budget <= 0 || ctx.length <= budget) {
+    // Fits (or the user text alone fills the budget — send it as-is).
+    return budget <= 0 ? userText : `${prefix}${ctx}${suffix}`;
+  }
+  return `${prefix}${ctx.slice(0, budget)}${suffix}`;
 }
 
 /** What goes out on a later turn: only the new user message. */
