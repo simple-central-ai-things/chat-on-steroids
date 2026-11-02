@@ -45,3 +45,34 @@ jobs:
         run: |
           npx tsc -p test/scgc-gateway/tsconfig.build.json
           node --test "test/scgc-gateway/.build/test/scgc-gateway/*.test.js"
+
+  deploy-guard:
+    name: Deploy surface contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Dockerfile builds this repo (it used to live in a separate repo
+      # whose CI probed GitHub for the branch contract; now the checks are
+      # local — same contract, no network).
+      - name: Verify scgc/Dockerfile builds this repo's current branch
+        run: |
+          branch=$(sed -n 's/^ARG COS_BRANCH=//p' scgc/Dockerfile)
+          repo=$(sed -n 's/^ARG COS_REPO=//p' scgc/Dockerfile)
+          test -n "$branch" && test -n "$repo"
+          slug=$(printf '%s' "$repo" | sed 's#https://github.com/##; s#\.git$##')
+          test "$slug" = "simple-central-ai-things/chat-on-steroids"
+          test "$branch" = "${GITHUB_REF_NAME}"
+          # the module entry point and the standalone test pipeline must be
+          # present in the working tree
+          test -f src/main/openai-gateway/openai-server.ts
+          grep -q "startOpenAiServer" src/main/openai-gateway/openai-server.ts
+          test -f test/scgc-gateway/tsconfig.json
+          grep -q "NodeNext" test/scgc-gateway/tsconfig.json
+          # the bootstrap wiring must reference the module
+          grep -q "openai-gateway/wire.js" src/main/index.ts
+          # the deploy surface the Dockerfile COPYs must exist too
+          test -f scgc/xstartup && test -f scgc/entrypoint.sh
+          test -f scgc/browser-watch.sh && test -x scgc/browser-watch.sh
+          echo "deploy surface OK: ${slug} @ ${branch}"

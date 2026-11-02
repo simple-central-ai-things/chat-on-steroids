@@ -1,0 +1,53 @@
+# SCGC deploy TEMPLATE — placeholders only. The LIVE compose file sits at the
+# deploy-directory root (next to gateway.env, vnc-passwd, keyring-passphrase,
+# userdata/ and the data dirs), because its build context and volume paths are
+# relative to that directory. Copy this file there as docker-compose.yml and
+# fill in the host-side material; a live copy with real values must never be
+# committed (see README, Deploy).
+name: cos-gateway
+
+services:
+  cos:
+    build:
+      context: .
+      dockerfile: scgc/Dockerfile
+    image: cos-gateway
+    container_name: cos-gateway-cos
+    # Chromium needs more than Docker's 64MB default /dev/shm.
+    shm_size: "1g"
+    ports:
+      # 5901 is VNC display :1 inside the container. Published on the host's
+      # LOOPBACK ONLY — reach it through an authenticated SSH tunnel
+      # (ssh -N -L 5902:127.0.0.1:5902 <deploy-host>), never raw LAN traffic:
+      # VncAuth has no TLS transport.
+      - "127.0.0.1:5902:5901"
+      # The OpenAI-compatible gateway, served from inside the app process.
+      # Reachable on the LAN so the LiteLLM proxy can consume it; every /v1/*
+      # route is bearer-protected and fail-closed.
+      - "8793:8793"
+    env_file:
+      # GATEWAY_API_KEY, PORT, TURN_TIMEOUT_SECONDS (see .env.example).
+      - gateway.env
+    volumes:
+      # The session script (the same file the image bakes) overrides the baked
+      # copy at runtime, so a tweak takes effect on `docker compose up -d`
+      # without a rebuild. ~/.config/tigervnc is the modern TigerVNC config
+      # dir (legacy ~/.vnc triggers a migration attempt that fails on a
+      # read-only mount).
+      - ./scgc/xstartup:/home/cos/.config/tigervnc/xstartup:ro
+      # VNC password file, produced by `vncpasswd` on the host.
+      - ./vnc-passwd:/home/cos/.config/tigervnc/passwd:ro
+      # CoS app data: sessions, keyring, the gateway's state.json.
+      - ./userdata:/home/cos/.config/chat-on-steroids
+      # Default syncthing workspace, shared bidirectionally with the agent
+      # machines (point the CoS setup "Folder" step at /home/cos/workspace).
+      - ./workspace:/home/cos/workspace
+      # Any directory registered with cos-share.sh appears here as <slug>/.
+      - ./shared:/home/cos/shared
+      # The keyring passphrase xstartup unlocks with (chmod 600).
+      - ./keyring-passphrase:/home/cos/keyring-passphrase:ro
+      # The keyring DATA itself — persists the ChatGPT session CoS stores via
+      # Secret Service across container rebuilds (the userData volume alone
+      # would not cover it).
+      - ./keyrings:/home/cos/.local/share/keyrings
+    restart: unless-stopped
