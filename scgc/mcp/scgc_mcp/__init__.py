@@ -1,4 +1,4 @@
-"""scgc-mcp — MCP server for the SCGC gateway surface on the CoS fork.
+"""scgc-mcp — MCP server for the CoS gateway surface on the CoS fork.
 
 Exposes the syncthing hub join/share tools and the CoS OpenAI gateway
 controls as MCP tools to any MCP-capable agent harness. Dependency-free

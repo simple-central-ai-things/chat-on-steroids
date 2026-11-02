@@ -1,7 +1,7 @@
-# SCGC — OpenAI-compatible gateway compiled into Chat On Steroids
+# CoS gateway — OpenAI-compatible API compiled into Chat On Steroids
 
-OpenAI-compatible API server compiled into our pinned fork of Chat On
-Steroids (CoS), the desktop automation app for ChatGPT. The gateway module
+OpenAI-compatible API server compiled into this fork of Chat On Steroids
+(CoS), the desktop automation app for ChatGPT. The gateway module
 (`src/main/openai-gateway/`), its offline tests (`test/scgc-gateway/`) and
 the deploy surface (this `scgc/` directory) all live as commits on the
 gateway branch `scgc/v2.1.49-gateway`; `main` is the untouched upstream
@@ -9,7 +9,7 @@ tree.
 
 ## What
 
-SCGC is the OpenAI-compatible face of a ChatGPT membership that runs through
+The CoS gateway is the OpenAI-compatible face of a ChatGPT membership that runs through
 Chat On Steroids (CoS). Instead of a sidecar service talking to CoS's
 loopback control API, the gateway is a TypeScript module compiled directly
 into CoS's Electron main process (`src/main/openai-gateway/`). When the app
@@ -24,7 +24,7 @@ canonicalization merges them with the other sources.
 ## Why
 
 - The ChatGPT membership models have no first-party API. CoS drives them
-  through a real browser session; SCGC exposes that session through the
+  through a real browser session; the gateway exposes that session through the
   standard `chat/completions` contract, so any OpenAI client — LiteLLM,
   SDKs, agents — can use it.
 - In-process beats sidecar here. The gateway calls CoS's internal functions

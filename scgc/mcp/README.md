@@ -1,7 +1,7 @@
 # scgc-mcp
 
 Installable Python package (`scgc-mcp`, stdlib only) that exposes the
-syncthing hub join/share helpers and the SCGC OpenAI gateway controls as
+syncthing hub join/share helpers and the CoS OpenAI gateway controls as
 MCP tools to any MCP-capable agent harness. The helper scripts ship inside
 the package (`scgc_mcp/helpers/`) as package data.
 

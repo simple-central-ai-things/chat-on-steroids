@@ -1,12 +1,12 @@
-# AGENTS.md — SCGC surface (gateway branch + deploy surface)
+# AGENTS.md — CoS gateway surface (gateway branch + deploy surface)
 
-Project rules for agents working on the SCGC surface of this fork. The
+Project rules for agents working on the CoS gateway surface of this fork. The
 repo-root AGENTS.md (the CoS product map) and the org-wide rules apply on
 top of this file.
 
 ## What this surface is
 
-SCGC compiles an OpenAI-compatible API server directly into Chat On
+The CoS gateway compiles an OpenAI-compatible API server directly into Chat On
 Steroids (CoS). Everything lives on this repo's `scgc/*` branches — `main`
 is the untouched upstream tree and must never receive the gateway code:
 
