@@ -71,6 +71,8 @@ export interface CosEvent {
   seq: number;
   kind: string;
   inputId?: string;
+  /** ChatGPT's own turn id when the extension could read it (BaseEvent.turnId). */
+  turnId?: string;
   final?: boolean;
   message?: { text?: string };
   retryAt?: number;
@@ -407,7 +409,7 @@ export class TurnManager {
     const deadline = this.now() + this.turnTimeoutMs;
     const anchor = await this.findAnchor(info.sessionId!, info.turnInput!, deadline);
     if (anchor === null) return; // the row never delivered; nothing is running
-    await this.waitTurn(info.sessionId!, anchor + 1, deadline, false);
+    await this.waitTurn(info.sessionId!, anchor.seq + 1, deadline, false, anchor.turnId);
   }
 
   /**
@@ -541,11 +543,22 @@ export class TurnManager {
 
   /**
    * Locate the `user_message` event carrying our input id (the turn's anchor).
-   * Returns its seq, or null when the input row never got delivered — nothing
-   * will ever happen for that turn. Raises TurnTimeout when the anchor never
-   * appears before the deadline.
+   * Returns the anchor event (its seq plus, when CoS recorded it, its turnId),
+   * or null when the input row never got delivered — nothing will ever happen
+   * for that turn. Raises TurnTimeout when the anchor never appears before the
+   * deadline.
+   *
+   * The anchor is the only event tied to our inputId, but its journal position
+   * is not reliable: CoS records it at its residence seq, which can sit AFTER
+   * the turn_end (observed live for a turn queued hours before delivery). So
+   * the follow must not order by seq after the anchor — it keys by the turnId
+   * the anchor carries (shared by the turn's turn_end and final answer).
    */
-  async findAnchor(sessionId: string, inputId: string, deadline: number): Promise<number | null> {
+  async findAnchor(
+    sessionId: string,
+    inputId: string,
+    deadline: number,
+  ): Promise<{ seq: number; turnId?: string } | null> {
     let fromSeq = 0;
     for (;;) {
       if (this.now() >= deadline) throw new TurnTimeout('the message was never recorded as sent');
@@ -554,7 +567,7 @@ export class TurnManager {
       });
       if (page !== null && page !== undefined) {
         for (const event of page.events) {
-          if (event.inputId === inputId) return event.seq;
+          if (event.inputId === inputId) return { seq: event.seq, turnId: event.turnId };
         }
         if (page.nextFrom > fromSeq) {
           fromSeq = page.nextFrom;
@@ -569,18 +582,29 @@ export class TurnManager {
   }
 
   /**
-   * Follow a turn from after its anchor to its end. Returns the final
-   * `assistant_message` text (up to `turn_end`). Raises TurnError on a
-   * `chat_error` event or a `turn_end` with no answer, TurnTimeout when the
-   * deadline passes first.
+   * Follow a turn to its end. Returns the final `assistant_message` text.
+   * Raises TurnError on a `chat_error` event or a `turn_end` with no answer,
+   * TurnTimeout when the deadline passes first.
+   *
+   * When the turn's `turnId` is known (the anchor carried it), completion is
+   * keyed by that id instead of by journal order: the final answer and the
+   * turn_end are matched to the id wherever they sit in the session, so a
+   * turn whose events were recorded before its late-landing anchor still
+   * resolves to its recorded answer instead of waiting out the deadline.
+   * Without a turnId the positional scan from `fromSeq` stands (older
+   * journals that recorded no turn id cannot be keyed any other way).
    */
   async waitTurn(
     sessionId: string,
     fromSeq: number,
     deadline: number,
     needAnswer: boolean,
+    turnId?: string,
   ): Promise<string | null> {
-    let cursor = fromSeq;
+    // Keyed mode scans the whole journal — the turn's rows may sit anywhere
+    // (their seq order versus the anchor is exactly what broke). Positional
+    // mode keeps the original from-cursor start.
+    let cursor = turnId === undefined ? fromSeq : 0;
     let answer: string | null = null;
     for (;;) {
       if (this.now() >= deadline) throw new TurnTimeout('the turn did not finish in time');
@@ -589,6 +613,9 @@ export class TurnManager {
       });
       if (page !== null && page !== undefined) {
         for (const event of page.events) {
+          // Keyed mode attributes every row to its turn id; an untagged row
+          // cannot be ours and is skipped. Positional mode uses all rows.
+          if (turnId !== undefined && event.turnId !== turnId) continue;
           if (event.kind === 'assistant_message' && event.final === true) {
             answer = event.message?.text ?? '';
           } else if (event.kind === 'chat_error') {
@@ -610,7 +637,7 @@ export class TurnManager {
     }
   }
 
-  /** Follow the whole turn: anchor, then the answer after it. */
+  /** Follow the whole turn: anchor, then the answer for that turn's id. */
   async followTurn(info: SessionInfo, inputId: string): Promise<string> {
     const sessionId = info.sessionId;
     if (sessionId === null) throw new GatewayError(502, 'no_session', 'no session to follow');
@@ -620,7 +647,7 @@ export class TurnManager {
       const row = (await this.internals.listInputs()).find((candidate) => candidate.id === inputId);
       throw mapUndelivered(row?.error);
     }
-    return (await this.waitTurn(sessionId, anchor + 1, deadline, true)) ?? '';
+    return (await this.waitTurn(sessionId, anchor.seq + 1, deadline, true, anchor.turnId)) ?? '';
   }
 
   /** A wait timer that is unref'd unless the manager was told to hold the loop. */

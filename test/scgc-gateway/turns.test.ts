@@ -423,3 +423,110 @@ test('finishTurn clears the in-flight slot and persists the mapping', async () =
   assert.equal(persisted['k1']?.turn_seq, 1, 'the consumed sequence is persisted');
   release();
 });
+
+// --------------------------------------------------------------------------
+// Late-anchor re-attach (live gap found in the 2026-11-01 E2E): CoS records
+// the delivered user_message at its residence seq, which can sit AFTER the
+// turn_end. The follow must key by turnId, not by seq order after the anchor.
+// --------------------------------------------------------------------------
+
+/**
+ * Deliver a full turn whose anchor lands LAST at its residence seq, the way
+ * CoS recorded it for a turn queued hours before delivery: the final answer
+ * and the turn_end are already in the journal before the user_message.
+ */
+function deliverLateAnchorTurn(
+  fake: FakeCos,
+  inputId: string,
+  answer: string,
+  turnId: string,
+): void {
+  const row = fake.inputs.get(inputId);
+  if (row === undefined) throw new Error('deliverLateAnchorTurn: unknown input id');
+  const sessionId = row.sessionId!;
+  fake.appendEvent(sessionId, { kind: 'assistant_message', final: true, message: { text: answer }, turnId });
+  fake.appendEvent(sessionId, { kind: 'turn_end', outcome: 'completed', turnId });
+  fake.appendEvent(sessionId, { kind: 'user_message', message: { text: '...' }, inputId, turnId });
+  fake.notify(sessionId);
+}
+
+test('a retry re-attaches to an already-completed turn whose anchor landed after the turn end', async () => {
+  const fake = new FakeCos();
+  const manager = managerFor(fake);
+  const { info, release } = await manager.acquire('k1');
+  try {
+    const sent = await sendPlain(manager, 'k1', info, 'slow question');
+    deliverLateAnchorTurn(fake, sent.inputId, 'the recorded answer', 'turn-1');
+
+    // The retry re-plans the same logical turn and must get the recorded
+    // answer back instead of waiting out the deadline.
+    const retry = manager.planTurn('k1', normalizeMessages([
+      { role: 'assistant', content: 'earlier' },
+      { role: 'user', content: 'slow question' }
+    ]), null, null, false);
+    assert.equal(retry.replaying, true);
+    assert.equal(retry.inputId, sent.inputId);
+    assert.equal(await manager.followTurn(info, sent.inputId), 'the recorded answer');
+  } finally {
+    release();
+  }
+});
+
+test('a different turn settles immediately once the leftover turn has completed before its anchor', async () => {
+  const fake = new FakeCos();
+  const manager = managerFor(fake);
+  const { info, release } = await manager.acquire('k1');
+  try {
+    const sent = await sendPlain(manager, 'k1', info, 'slow question');
+    deliverLateAnchorTurn(fake, sent.inputId, 'the recorded answer', 'turn-1');
+    info.turnStartedAt = 0;
+
+    // A DIFFERENT message may send without waiting out the turn timeout.
+    const later = await sendPlain(manager, 'k1', info, 'the next question');
+    assert.equal(later.replayed, false);
+    assert.notEqual(later.inputId, sent.inputId);
+  } finally {
+    release();
+  }
+});
+
+test('a completed turn with an untagged anchor keeps the legacy positional follow', async () => {
+  const fake = new FakeCos();
+  const manager = managerFor(fake, { turnTimeoutMs: 50 });
+  const { info, release } = await manager.acquire('k1');
+  try {
+    const sent = await sendPlain(manager, 'k1', info, 'slow question');
+    // No turnId anywhere: nothing to key by, the positional wait stands.
+    fake.appendEvent(sent.sessionId, { kind: 'assistant_message', final: true, message: { text: 'a' } });
+    fake.appendEvent(sent.sessionId, { kind: 'turn_end', outcome: 'completed' });
+    fake.appendEvent(sent.sessionId, { kind: 'user_message', message: { text: '...' }, inputId: sent.inputId });
+    fake.notify(sent.sessionId);
+    await assert.rejects(
+      manager.followTurn(info, sent.inputId),
+      TurnTimeout,
+      'the untagged journal cannot be keyed by turn id; the deadline stands'
+    );
+  } finally {
+    release();
+  }
+});
+
+test('a chat_error recorded for the same turn id is surfaced by the keyed follow', async () => {
+  const fake = new FakeCos();
+  const manager = managerFor(fake);
+  const { info, release } = await manager.acquire('k1');
+  try {
+    const sent = await sendPlain(manager, 'k1', info, 'slow question');
+    const retryAt = Date.now() + 120_000;
+    fake.appendEvent(sent.sessionId, { kind: 'chat_error', message: { text: 'limited' }, turnId: 'turn-1', retryAt, recoverable: true });
+    fake.appendEvent(sent.sessionId, { kind: 'turn_end', outcome: 'failed', turnId: 'turn-1' });
+    fake.appendEvent(sent.sessionId, { kind: 'user_message', message: { text: '...' }, inputId: sent.inputId, turnId: 'turn-1' });
+    fake.notify(sent.sessionId);
+    await assert.rejects(
+      manager.followTurn(info, sent.inputId),
+      (error: unknown) => error instanceof TurnError && error.retryAt === retryAt
+    );
+  } finally {
+    release();
+  }
+});
