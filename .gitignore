@@ -52,5 +52,5 @@ proof-*.txt
 # Written by scripts/write-extension-stamp.mjs at packaging time; see that script.
 /extension/build-stamp.txt
 
-# SCGC gateway test build output (test/scgc-gateway/tsconfig.build.json).
-test/scgc-gateway/.build/
+# CoS gateway test build output (test/cos-gateway/tsconfig.build.json).
+test/cos-gateway/.build/

@@ -28,7 +28,7 @@ async function startGateway(
   // Rebind onto an ephemeral port so parallel tests never fight over 8793.
   config = { ...config, port: 0 };
   const gateway = await startOpenAiServer(fake, config, {
-    stateDir: mkdtempSync(path.join(tmpdir(), 'scgc-http-')),
+    stateDir: mkdtempSync(path.join(tmpdir(), 'cos-gateway-http-')),
     managerOptions: { pollMs: 1, queueWaitMs: 100, turnTimeoutMs, refTimers: true }
   });
   after(async () => gateway.stop());

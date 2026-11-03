@@ -16,7 +16,7 @@ import { GatewayError } from '../../src/main/openai-gateway/errors.js';
 import { normalizeMessages } from '../../src/main/openai-gateway/fold.js';
 import { FakeCos, deliverTurn } from './fake-cos.js';
 
-const stateDir = (): string => mkdtempSync(path.join(tmpdir(), 'scgc-test-'));
+const stateDir = (): string => mkdtempSync(path.join(tmpdir(), 'cos-gateway-test-'));
 
 const managerFor = (fake: FakeCos, extra: Record<string, unknown> = {}): TurnManager =>
   new TurnManager(fake, stateDir(), { pollMs: 1, queueWaitMs: 50, turnTimeoutMs: 2000, refTimers: true, ...extra });
