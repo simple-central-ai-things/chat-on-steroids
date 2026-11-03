@@ -303,10 +303,11 @@ async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void
   }
 }
 
-test('v1/status reports the sign-in proof and catalog state behind the bearer key', async () => {
+test('v1/status reports the sign-in proof, live evidence and catalog state behind the bearer key', async () => {
   const fake = new FakeCos();
   fake.catalog = readyCatalog;
-  fake.browserProof = { browserId: 'abc', version: '2.1.49', signedIn: true };
+  fake.browserProof = { browserId: 'abc', version: '2.1.49', signedIn: true, since: 1_730_000_000_000 };
+  fake.liveEvidence = { browserRunning: true, extensionFresh: true };
   const gateway = await startGateway(fake, gatewayConfigFromEnv({ GATEWAY_API_KEY: key }));
 
   const reply = await fetch(`${base(gateway)}/v1/status`, { headers: authed });
@@ -314,7 +315,11 @@ test('v1/status reports the sign-in proof and catalog state behind the bearer ke
   assert.deepEqual(await reply.json(), {
     ok: true,
     protocol: PROTOCOL,
-    chatgpt: { signedIn: true, browser: 'external', extensionVersion: '2.1.49' },
+    chatgpt: {
+      lastKnown: { signedIn: true, since: 1_730_000_000_000, browserVersion: '2.1.49' },
+      live: { browserRunning: true, extensionFresh: true },
+      effective: true
+    },
     catalog: { state: 'ready', observedAt: 1_730_000_000_000, models: 1 }
   });
 
@@ -327,18 +332,56 @@ test('v1/status never invents a sign-in state', async () => {
   // The catalog may be cached while the proof says signed out, and a missing
   // proof must read as unknown (null), not as signed in.
   const cases: Array<{
-    proof: { browserId: string; version: string; signedIn: boolean | null } | null;
-    expect: { signedIn: boolean | null }
+    proof: { browserId: string; version: string; signedIn: boolean | null; since?: number | null } | null;
+    expect: { lastKnown: { signedIn: boolean | null; since: number | null; browserVersion: string | null } }
   }> = [
-    { proof: { browserId: 'abc', version: '2.1.49', signedIn: false }, expect: { signedIn: false } },
-    { proof: null, expect: { signedIn: null } }
+    {
+      proof: { browserId: 'abc', version: '2.1.49', signedIn: false, since: 9 },
+      expect: { lastKnown: { signedIn: false, since: 9, browserVersion: '2.1.49' } }
+    },
+    {
+      proof: null,
+      expect: { lastKnown: { signedIn: null, since: null, browserVersion: null } }
+    }
   ];
   for (const { proof, expect } of cases) {
     fake.browserProof = proof;
+    fake.liveEvidence = { browserRunning: null, extensionFresh: null };
     const gateway = await startGateway(fake, gatewayConfigFromEnv({ GATEWAY_API_KEY: key }));
     const reply = await fetch(`${base(gateway)}/v1/status`, { headers: authed });
     assert.equal(reply.status, 200);
-    const body = (await reply.json()) as { chatgpt: { signedIn: boolean | null } };
-    assert.deepEqual(body.chatgpt.signedIn, expect.signedIn);
+    const body = (await reply.json()) as { chatgpt: { lastKnown: { signedIn: boolean | null } } };
+    assert.deepEqual(body.chatgpt.lastKnown, expect.lastKnown);
   }
+});
+
+test('v1/status effective is true only with live proof + running browser + fresh extension', async () => {
+  const fake = new FakeCos();
+  fake.catalog = readyCatalog;
+  const gateway = await startGateway(fake, gatewayConfigFromEnv({ GATEWAY_API_KEY: key }));
+  const status = async (): Promise<{ chatgpt: { effective: boolean | null } }> =>
+    (await (await fetch(`${base(gateway)}/v1/status`, { headers: authed })).json()) as {
+      chatgpt: { effective: boolean | null };
+    };
+
+  // All three positive -> true.
+  fake.browserProof = { browserId: 'abc', version: '2.1.49', signedIn: true, since: 5 };
+  fake.liveEvidence = { browserRunning: true, extensionFresh: true };
+  assert.equal((await status()).chatgpt.effective, true);
+
+  // Proof says signed in but the browser is not running (the stale-true
+  // regression the backlog calls out): the live process probe says no.
+  fake.browserProof = { browserId: 'abc', version: '2.1.49', signedIn: true, since: 5 };
+  fake.liveEvidence = { browserRunning: false, extensionFresh: true };
+  assert.equal((await status()).chatgpt.effective, false);
+
+  // Signed-in proof but no live evidence at all -> unknown, never invented.
+  fake.browserProof = { browserId: 'abc', version: '2.1.49', signedIn: true, since: 5 };
+  fake.liveEvidence = { browserRunning: null, extensionFresh: null };
+  assert.equal((await status()).chatgpt.effective, null);
+
+  // Proof never answered and no live evidence -> unknown.
+  fake.browserProof = { browserId: 'abc', version: '2.1.49', signedIn: null, since: null };
+  fake.liveEvidence = { browserRunning: null, extensionFresh: null };
+  assert.equal((await status()).chatgpt.effective, null);
 });

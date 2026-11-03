@@ -15,6 +15,10 @@
  *   onSessionChange   — src/main/session/recorder.ts:176 (turn wakeups)
  *   getChatModels     — src/main/chat-models.ts:69 (the picker catalog)
  *   externalBrowserProof — src/main/browser-proof.ts (last ChatGPT sign-in proof)
+ *   liveChatGptEvidence — src/main/browser.ts isPreferredBrowserRunning (the
+ *     selected ChatGPT browser's live process probe) + src/main/bridge.ts
+ *     externalExtensionFresh (the read-only extension-freshness projection the
+ *     gateway adds beside the bridge's own owner, externalExtensionPresent).
  *
  * Pinned to CoS v2.1.49. A CoS upgrade that moves or renames any of these
  * fails the build (the wire patch stops applying, or these imports stop
@@ -26,6 +30,8 @@ import { readSession, readSessionEvents } from '../session/read-model.js';
 import { onSessionChange } from '../session/recorder.js';
 import { getChatModels } from '../chat-models.js';
 import { externalBrowserProof } from '../browser-proof.js';
+import { isPreferredBrowserRunning } from '../browser.js';
+import { externalExtensionFresh } from '../bridge.js';
 import type { SessionEventKind } from '../../shared/session.js';
 import type { CosInternals } from './turns.js';
 
@@ -46,6 +52,13 @@ export function createCosInternals(): CosInternals {
       sessionIds: change.sessionIds ?? []
     })),
     getChatModels: () => getChatModels(),
-    externalBrowserProof: () => externalBrowserProof()
+    externalBrowserProof: () => externalBrowserProof(),
+    liveChatGptEvidence: async () => {
+      const [browserRunning, extensionFresh] = await Promise.all([
+        isPreferredBrowserRunning(),
+        Promise.resolve(externalExtensionFresh())
+      ]);
+      return { browserRunning, extensionFresh };
+    }
   };
 }

@@ -184,7 +184,7 @@ async function handleRequest(
     return;
   }
   if (req.method === 'GET' && url === '/v1/status') {
-    handleStatus(res, internals);
+    await handleStatus(res, internals);
     return;
   }
   if (req.method === 'GET' && url === '/v1/models') {
@@ -209,19 +209,39 @@ function authorized(req: IncomingMessage, apiKey: string): boolean {
 
 /**
  * Operator/observability status: the gateway's own health plus the facts a
- * deploy check needs — whether ChatGPT's browser still reports signed in
- * (the persistent browser proof, not the cached catalog, which can outlive
- * a lost sign-in) and whether the model catalog is ready.
+ * deploy check needs — whether ChatGPT's browser is signed in (the persistent
+ * browser proof, which can outlive a lost sign-in) AND whether that browser is
+ * actually running with a fresh extension right now (live evidence, which the
+ * persistent proof alone can mislead on). `effective` is the truthful answer:
+ * true only when the proof says signed in AND the live browser is running AND
+ * the extension is fresh; false when any side says no; null when anything is
+ * unobserved. null never means "signed out".
  */
-function handleStatus(res: ServerResponse, internals: CosInternals): void {
+async function handleStatus(res: ServerResponse, internals: CosInternals): Promise<void> {
   const proof = internals.externalBrowserProof();
+  const live = await internals.liveChatGptEvidence();
   const catalog = internals.getChatModels();
+  const signedIn = proof?.signedIn ?? null;
+  const since = proof?.since ?? null;
+  const browserVersion = proof?.version ?? null;
+  const browserRunning = live.browserRunning;
+  const extensionFresh = live.extensionFresh;
+  // true ONLY with positive last-known sign-in AND live browser running AND a
+  // fresh extension; false when ANY side says no; null when unknown.
+  const effective =
+    signedIn === true && browserRunning === true && extensionFresh === true
+      ? true
+      : signedIn === false || browserRunning === false || extensionFresh === false
+        ? false
+        : null;
   send(res, 200, {
     ok: true,
     protocol: PROTOCOL,
-    chatgpt: proof !== null
-      ? { signedIn: proof.signedIn, browser: 'external', extensionVersion: proof.version }
-      : { signedIn: null, browser: 'external' },
+    chatgpt: {
+      lastKnown: { signedIn, since, browserVersion },
+      live: { browserRunning, extensionFresh },
+      effective
+    },
     catalog: {
       state: catalog.state,
       observedAt: catalog.observedAt,

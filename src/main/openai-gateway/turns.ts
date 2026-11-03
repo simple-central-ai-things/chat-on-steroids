@@ -112,10 +112,27 @@ export interface CosInternals {
   getChatModels(): ChatModelCatalog;
   /**
    * browser-proof.ts — the last sign-in proof of the ChatGPT browser (yes /
-   * no / unknown). A read-only projection: null means "never observed",
-   * which is distinct from signedOut.
+   * no / unknown) and when it was observed. A read-only projection: null means
+   * "never observed", which is distinct from signedOut; `since` is the epochMs
+   * of the newest sign-in observation, null when the browser never answered.
    */
-  externalBrowserProof(): { browserId: string; version: string; signedIn: boolean | null } | null;
+  externalBrowserProof(): {
+    browserId: string;
+    version: string;
+    signedIn: boolean | null;
+    since: number | null;
+  } | null;
+  /**
+   * browser.ts isPreferredBrowserRunning + bridge.ts externalExtensionFresh —
+   * LIVE evidence, distinct from the persistent proof: whether the selected
+   * ChatGPT browser process is running right now and whether its extension has
+   * been heard from within BROWSER_PRESENT_MS. null means "not observed", never
+   * an invented boolean (a quiet browser does not prove it is gone).
+   */
+  liveChatGptEvidence(): Promise<{
+    browserRunning: boolean | null;
+    extensionFresh: boolean | null;
+  }>;
 }
 
 export interface TurnManagerOptions {

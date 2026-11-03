@@ -1238,6 +1238,17 @@ function externalExtensionPresent(): boolean {
 }
 
 /**
+ * A narrow read-only projection of extension freshness for the gateway's
+ * /v1/status live evidence (bridge.ts owns the fact). True when the external
+ * browser's companion has been heard from within BROWSER_PRESENT_MS, false
+ * when it is quiet, null before it ever polled this process. It never invents
+ * presence: it is `externalExtensionPresent()` gated on a first sighting.
+ */
+export function externalExtensionFresh(): boolean | null {
+  return externalExtension?.seenAt === undefined ? null : externalExtensionPresent();
+}
+
+/**
  * Whether the external browser on record should stay the one Setup shows, over this request's.
  *
  * With Chrome and Firefox both connected, Setup showed whichever polled last rather than the

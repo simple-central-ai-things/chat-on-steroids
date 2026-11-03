@@ -86,10 +86,25 @@ export function noteExternalSignedIn(browserId: string, signedIn: boolean, at = 
   return true;
 }
 
-/** The lasting evidence for the person's own browser, or null. `signedIn` null: never answered. */
-export function externalBrowserProof(): { browserId: string; version: string; signedIn: boolean | null } | null {
-  return proof && { browserId: proof.browserId, version: proof.version,
-    signedIn: proof.signedInAt !== null ? true : proof.signedOutAt !== null ? false : null };
+/**
+ * The lasting evidence for the person's own browser, or null. `signedIn` null:
+ * never answered. `since` is the epochMs of the newest sign-in observation
+ * (`signedInAt` when ChatGPT answered signed in, else `signedOutAt`), null when
+ * the browser never answered — a read-only projection of the owner's timestamps
+ * so the gateway can report when the last-known state was observed.
+ */
+export function externalBrowserProof(): {
+  browserId: string;
+  version: string;
+  signedIn: boolean | null;
+  since: number | null;
+} | null {
+  return proof && {
+    browserId: proof.browserId,
+    version: proof.version,
+    signedIn: proof.signedInAt !== null ? true : proof.signedOutAt !== null ? false : null,
+    since: proof.signedInAt !== null ? proof.signedInAt : proof.signedOutAt ?? null
+  };
 }
 
 /** For tests: wait for the file to settle. */

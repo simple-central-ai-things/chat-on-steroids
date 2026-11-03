@@ -116,10 +116,26 @@ export class FakeCos implements CosInternals {
   }
 
   /** The external browser's last sign-in proof; null = never observed. */
-  browserProof: { browserId: string; version: string; signedIn: boolean | null } | null = null;
+  browserProof: { browserId: string; version: string; signedIn: boolean | null; since?: number | null } | null = null;
 
-  externalBrowserProof(): { browserId: string; version: string; signedIn: boolean | null } | null {
-    return this.browserProof;
+  externalBrowserProof(): { browserId: string; version: string; signedIn: boolean | null; since: number | null } | null {
+    if (this.browserProof === null) return null;
+    return {
+      browserId: this.browserProof.browserId,
+      version: this.browserProof.version,
+      signedIn: this.browserProof.signedIn,
+      since: this.browserProof.since ?? null
+    };
+  }
+
+  /** Live browser/extension evidence the gateway /v1/status reports. */
+  liveEvidence: { browserRunning: boolean | null; extensionFresh: boolean | null } = {
+    browserRunning: null,
+    extensionFresh: null
+  };
+
+  liveChatGptEvidence(): Promise<{ browserRunning: boolean | null; extensionFresh: boolean | null }> {
+    return Promise.resolve({ ...this.liveEvidence });
   }
 }
 
