@@ -110,6 +110,12 @@ export interface CosInternals {
   onSessionChange(listener: (change: { sessionIds: readonly string[] }) => void): () => void;
   /** src/main/chat-models.ts:69 — the picker catalog. */
   getChatModels(): ChatModelCatalog;
+  /**
+   * browser-proof.ts — the last sign-in proof of the ChatGPT browser (yes /
+   * no / unknown). A read-only projection: null means "never observed",
+   * which is distinct from signedOut.
+   */
+  externalBrowserProof(): { browserId: string; version: string; signedIn: boolean | null } | null;
 }
 
 export interface TurnManagerOptions {

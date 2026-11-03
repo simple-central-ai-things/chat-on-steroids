@@ -183,6 +183,10 @@ async function handleRequest(
     send(res, 401, errorBody({ status: 401, code: 'unauthorized', message: 'bearer key required' }));
     return;
   }
+  if (req.method === 'GET' && url === '/v1/status') {
+    handleStatus(res, internals);
+    return;
+  }
   if (req.method === 'GET' && url === '/v1/models') {
     await handleModels(res, internals);
     return;
@@ -201,6 +205,29 @@ function authorized(req: IncomingMessage, apiKey: string): boolean {
   const a = Buffer.from(token);
   const b = Buffer.from(apiKey);
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/**
+ * Operator/observability status: the gateway's own health plus the facts a
+ * deploy check needs — whether ChatGPT's browser still reports signed in
+ * (the persistent browser proof, not the cached catalog, which can outlive
+ * a lost sign-in) and whether the model catalog is ready.
+ */
+function handleStatus(res: ServerResponse, internals: CosInternals): void {
+  const proof = internals.externalBrowserProof();
+  const catalog = internals.getChatModels();
+  send(res, 200, {
+    ok: true,
+    protocol: PROTOCOL,
+    chatgpt: proof !== null
+      ? { signedIn: proof.signedIn, browser: 'external', extensionVersion: proof.version }
+      : { signedIn: null, browser: 'external' },
+    catalog: {
+      state: catalog.state,
+      observedAt: catalog.observedAt,
+      models: catalog.models.length
+    }
+  });
 }
 
 async function handleModels(res: ServerResponse, internals: CosInternals): Promise<void> {

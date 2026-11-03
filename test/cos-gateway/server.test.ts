@@ -302,3 +302,43 @@ async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
+
+test('v1/status reports the sign-in proof and catalog state behind the bearer key', async () => {
+  const fake = new FakeCos();
+  fake.catalog = readyCatalog;
+  fake.browserProof = { browserId: 'abc', version: '2.1.49', signedIn: true };
+  const gateway = await startGateway(fake, gatewayConfigFromEnv({ GATEWAY_API_KEY: key }));
+
+  const reply = await fetch(`${base(gateway)}/v1/status`, { headers: authed });
+  assert.equal(reply.status, 200);
+  assert.deepEqual(await reply.json(), {
+    ok: true,
+    protocol: PROTOCOL,
+    chatgpt: { signedIn: true, browser: 'external', extensionVersion: '2.1.49' },
+    catalog: { state: 'ready', observedAt: 1_730_000_000_000, models: 1 }
+  });
+
+  const missing = await fetch(`${base(gateway)}/v1/status`);
+  assert.equal(missing.status, 401);
+});
+
+test('v1/status never invents a sign-in state', async () => {
+  const fake = new FakeCos();
+  // The catalog may be cached while the proof says signed out, and a missing
+  // proof must read as unknown (null), not as signed in.
+  const cases: Array<{
+    proof: { browserId: string; version: string; signedIn: boolean | null } | null;
+    expect: { signedIn: boolean | null }
+  }> = [
+    { proof: { browserId: 'abc', version: '2.1.49', signedIn: false }, expect: { signedIn: false } },
+    { proof: null, expect: { signedIn: null } }
+  ];
+  for (const { proof, expect } of cases) {
+    fake.browserProof = proof;
+    const gateway = await startGateway(fake, gatewayConfigFromEnv({ GATEWAY_API_KEY: key }));
+    const reply = await fetch(`${base(gateway)}/v1/status`, { headers: authed });
+    assert.equal(reply.status, 200);
+    const body = (await reply.json()) as { chatgpt: { signedIn: boolean | null } };
+    assert.deepEqual(body.chatgpt.signedIn, expect.signedIn);
+  }
+});

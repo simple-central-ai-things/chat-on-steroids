@@ -14,6 +14,7 @@
  *   readSessionEvents — src/main/session/read-model.ts:85 (from-cursor feed)
  *   onSessionChange   — src/main/session/recorder.ts:176 (turn wakeups)
  *   getChatModels     — src/main/chat-models.ts:69 (the picker catalog)
+ *   externalBrowserProof — src/main/browser-proof.ts (last ChatGPT sign-in proof)
  *
  * Pinned to CoS v2.1.49. A CoS upgrade that moves or renames any of these
  * fails the build (the wire patch stops applying, or these imports stop
@@ -24,6 +25,7 @@ import { listInputs, sessionInputPolicy } from '../session/input.js';
 import { readSession, readSessionEvents } from '../session/read-model.js';
 import { onSessionChange } from '../session/recorder.js';
 import { getChatModels } from '../chat-models.js';
+import { externalBrowserProof } from '../browser-proof.js';
 import type { SessionEventKind } from '../../shared/session.js';
 import type { CosInternals } from './turns.js';
 
@@ -43,6 +45,7 @@ export function createCosInternals(): CosInternals {
     onSessionChange: (listener) => onSessionChange((change) => listener({
       sessionIds: change.sessionIds ?? []
     })),
-    getChatModels: () => getChatModels()
+    getChatModels: () => getChatModels(),
+    externalBrowserProof: () => externalBrowserProof()
   };
 }

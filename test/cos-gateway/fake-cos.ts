@@ -114,6 +114,13 @@ export class FakeCos implements CosInternals {
   getChatModels(): ChatModelCatalog {
     return this.catalog;
   }
+
+  /** The external browser's last sign-in proof; null = never observed. */
+  browserProof: { browserId: string; version: string; signedIn: boolean | null } | null = null;
+
+  externalBrowserProof(): { browserId: string; version: string; signedIn: boolean | null } | null {
+    return this.browserProof;
+  }
 }
 
 /** Deliver a full turn for an admitted input, the way CoS would. */
