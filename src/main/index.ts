@@ -792,8 +792,8 @@ void app.whenReady().then(async () => {
   if (getConfig().controlApi.enabled) {
     startControlApi().catch((error: Error) => logWarn(`control API did not start: ${error.message}`));
   }
-  // SCGC: the OpenAI-compatible gateway listens on 0.0.0.0:PORT inside this
-  // process, next to the loopback-only control API. Fail-closed: without
+  // CoS gateway: the OpenAI-compatible gateway listens on 0.0.0.0:PORT inside
+  // this process, next to the loopback-only control API. Fail-closed: without
   // GATEWAY_API_KEY it refuses every /v1/* request and /health says so.
   void startOpenAiGateway({ userData, log: (line) => logInfo(`openai gateway: ${line}`) }).catch((error: Error) =>
     logError(`OpenAI gateway did not start: ${error.message}`));
