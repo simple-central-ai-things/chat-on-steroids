@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   errorBody,
+  GATEWAY_ERRORS,
+  gatewayError,
   isReasoningEffort,
   mapChatError,
   mapEndedWithoutAnswer,
@@ -80,4 +82,43 @@ test('reasoning effort membership is checked against CoS vocabulary', () => {
   assert.equal(isReasoningEffort('ultra'), true);
   assert.equal(isReasoningEffort('turbo'), false);
   assert.equal(isReasoningEffort(3), false);
+});
+
+test('every mapped error status stays bound to the GATEWAY_ERRORS ledger', () => {
+  // mapRefusal and the map* helpers must never drift from the code -> status
+  // table: each mapped error's status is exactly the ledger's status for its
+  // code. chat_error is the one deadline-dependent code (429 with a Retry-After
+  // deadline, 502 without), so it is asserted against the ledger's allowed set.
+  const cases: Array<{ code: string; error: { status: number; retryAfterSeconds?: number } }> = [
+    { code: 'shutting_down', error: mapRefusal(new Error('The app is shutting down'))! },
+    { code: 'cancelled', error: mapRefusal(new Error('Input cancelled'))! },
+    { code: 'busy', error: mapRefusal(new Error('One message is already awaiting delivery for this chat.'))! },
+    { code: 'id_conflict', error: mapRefusal(new Error('Message id already belongs to different input'))! },
+    { code: 'chat_blocked', error: mapRefusal(new Error('Unblock this conversation before sending'))! },
+    { code: 'no_chat', error: mapRefusal(new Error('This recording has no ChatGPT conversation'))! },
+    { code: 'queue_full', error: mapRefusal(new Error('The message queue is full'))! },
+    { code: 'session_busy', error: mapSessionBusy(5) },
+    { code: 'turn_timeout', error: mapTurnTimeout(600) },
+    { code: 'turn_ended_without_answer', error: mapEndedWithoutAnswer('stopped') },
+    { code: 'not_delivered', error: mapUndelivered('no delivery') },
+    { code: 'chat_error', error: mapChatError({ message: { text: 'limit' }, retryAt: Date.now() + 6000 }, Date.now()) },
+    { code: 'chat_error', error: mapChatError({ message: { text: 'hard stop' } }, 0) }
+  ];
+  for (const { code, error } of cases) {
+    const spec = GATEWAY_ERRORS[code as keyof typeof GATEWAY_ERRORS];
+    assert.ok(spec, `no ledger row for ${code}`);
+    const status = spec.status as number | readonly number[];
+    const statuses: readonly number[] = Array.isArray(status) ? status : [status];
+    assert.ok(
+      statuses.includes(error.status),
+      `${code} mapped to ${error.status} but the ledger allows ${statuses.join(', ')}`,
+    );
+  }
+});
+
+test('gatewayError binds the code to its ledger status', () => {
+  assert.equal(gatewayError('model_unknown').status, GATEWAY_ERRORS.model_unknown.status);
+  assert.equal(gatewayError('models_not_ready').status, GATEWAY_ERRORS.models_not_ready.status);
+  assert.equal(gatewayError('id_conflict').code, 'id_conflict');
+  assert.equal(gatewayError('busy', 'msg', 7).retryAfterSeconds, 7);
 });

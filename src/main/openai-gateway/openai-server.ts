@@ -23,6 +23,7 @@ import {
 import { conversationKey, normalizeMessages, FoldError, type NormalizedMessage } from './fold.js';
 import {
   errorBody,
+  gatewayError,
   isReasoningEffort,
   mapTurnTimeout,
   type GatewayErrorData,
@@ -282,7 +283,7 @@ async function handleCompletions(
   try {
     body = JSON.parse(raw) as CompletionRequest;
   } catch {
-    throw new GatewayError(400, 'invalid_json', 'the request body is not valid JSON');
+    throw gatewayError('invalid_json');
   }
 
   const normalized: NormalizedMessage[] =
@@ -290,7 +291,7 @@ async function handleCompletions(
       try {
         return normalizeMessages(body.messages);
       } catch (error) {
-        if (error instanceof FoldError) throw new GatewayError(400, 'invalid_body', error.message);
+        if (error instanceof FoldError) throw gatewayError('invalid_body', error.message);
         throw error;
       }
     })();
@@ -298,7 +299,7 @@ async function handleCompletions(
   // v1 ignores `stream`: the turn is followed to completion and answered whole.
   if (body.reasoning_effort !== undefined && body.reasoning_effort !== null &&
       !isReasoningEffort(body.reasoning_effort)) {
-    throw new GatewayError(400, 'invalid_reasoning_effort',
+    throw gatewayError('invalid_reasoning_effort',
       `reasoning_effort must be one of ${REASONING_EFFORTS.join(', ')}`);
   }
   const includeSystem = body.include_system === false
@@ -313,7 +314,7 @@ async function handleCompletions(
   try {
     key = conversationKey(normalized, sessionOverride(req));
   } catch (error) {
-    if (error instanceof FoldError) throw new GatewayError(400, 'invalid_body', error.message);
+    if (error instanceof FoldError) throw gatewayError('invalid_body', error.message);
     throw error;
   }
 
@@ -324,7 +325,7 @@ async function handleCompletions(
     try {
       plan = manager.planTurn(key, normalized, selection.model, selection.reasoningEffort, includeSystem);
     } catch (error) {
-      if (error instanceof FoldError) throw new GatewayError(400, 'invalid_body', error.message);
+      if (error instanceof FoldError) throw gatewayError('invalid_body', error.message);
       throw error;
     }
     let answer: string;
@@ -368,7 +369,7 @@ async function readBody(req: IncomingMessage): Promise<string> {
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
     if (size > MAX_BODY_BYTES) {
-      throw new GatewayError(413, 'body_too_large', 'the request body is too large');
+      throw gatewayError('body_too_large');
     }
     chunks.push(chunk as Buffer);
   }
@@ -409,7 +410,7 @@ async function followAnswer(
       manager.finishTurn(info);
       throw error.toError();
     }
-    throw error instanceof GatewayError ? error : new GatewayError(502, 'internal', 'internal error');
+    throw error instanceof GatewayError ? error : gatewayError('internal');
   }
 }
 

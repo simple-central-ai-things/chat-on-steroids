@@ -88,23 +88,30 @@ export function noteExternalSignedIn(browserId: string, signedIn: boolean, at = 
 
 /**
  * The lasting evidence for the person's own browser, or null. `signedIn` null:
- * never answered. `since` is the epochMs of the newest sign-in observation
- * (`signedInAt` when ChatGPT answered signed in, else `signedOutAt`), null when
- * the browser never answered — a read-only projection of the owner's timestamps
- * so the gateway can report when the last-known state was observed.
+ * never answered.
  */
 export function externalBrowserProof(): {
   browserId: string;
   version: string;
   signedIn: boolean | null;
-  since: number | null;
 } | null {
   return proof && {
     browserId: proof.browserId,
     version: proof.version,
-    signedIn: proof.signedInAt !== null ? true : proof.signedOutAt !== null ? false : null,
-    since: proof.signedInAt !== null ? proof.signedInAt : proof.signedOutAt ?? null
+    signedIn: proof.signedInAt !== null ? true : proof.signedOutAt !== null ? false : null
   };
+}
+
+/**
+ * A tiny read-only projection of when the last-known sign-in state was
+ * observed (the gateway's /v1/status `lastKnown.since`), kept separate from
+ * externalBrowserProof() so that function's shape stays stable. `signedInAt`
+ * when ChatGPT answered signed in, else `signedOutAt`; null when the browser
+ * never answered or there is no proof.
+ */
+export function externalBrowserProofSince(): number | null {
+  if (proof === null) return null;
+  return proof.signedInAt !== null ? proof.signedInAt : proof.signedOutAt ?? null;
 }
 
 /** For tests: wait for the file to settle. */

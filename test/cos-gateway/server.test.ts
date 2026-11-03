@@ -11,6 +11,7 @@ import {
 } from '../../src/main/openai-gateway/openai-server.js';
 import { FakeCos, deliverTurn } from './fake-cos.js';
 import type { ChatModelCatalog } from '../../src/main/openai-gateway/catalog.js';
+import { GATEWAY_ERRORS } from '../../src/main/openai-gateway/errors.js';
 
 const key = 'test-key-123';
 const readyCatalog: ChatModelCatalog = {
@@ -384,4 +385,83 @@ test('v1/status effective is true only with live proof + running browser + fresh
   fake.browserProof = { browserId: 'abc', version: '2.1.49', signedIn: null, since: null };
   fake.liveEvidence = { browserRunning: null, extensionFresh: null };
   assert.equal((await status()).chatgpt.effective, null);
+});
+
+test('the error matrix answers the exact status + code + Retry-After, bound to GATEWAY_ERRORS', async () => {
+  const fake = new FakeCos();
+  fake.catalog = readyCatalog;
+  const gateway = await startGateway(fake, gatewayConfigFromEnv({ GATEWAY_API_KEY: key }));
+  const url = `${base(gateway)}/v1/chat/completions`;
+  const post = (body: unknown): Promise<Response> => fetch(url, {
+    method: 'POST', headers: { ...authed, 'content-type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const expectError = async (
+    promise: Promise<Response>,
+    code: string,
+    retryAfter?: number,
+  ): Promise<void> => {
+    const reply = await promise;
+    const spec = GATEWAY_ERRORS[code as keyof typeof GATEWAY_ERRORS];
+    assert.equal(reply.status, spec.status, `${code} status`);
+    assert.equal(reply.headers.get('retry-after'), retryAfter === undefined ? null : String(retryAfter),
+      `${code} Retry-After`);
+    const body = (await reply.json()) as { error: { code: string; message: string } };
+    assert.equal(body.error.code, code, `${code} code`);
+  };
+
+  // 429 busy — another message is already awaiting delivery (Retry-After exactly 5).
+  fake.sendError = 'One message is already awaiting delivery for this chat.';
+  await expectError(post({ messages: [{ role: 'user', content: 'x' }] }), 'busy', 5);
+
+  // 502 chat unusable — a blocked conversation and a chat with no ChatGPT page.
+  fake.sendError = 'Unblock this conversation before sending';
+  await expectError(post({ messages: [{ role: 'user', content: 'x' }] }), 'chat_blocked');
+  fake.sendError = 'This recording has no ChatGPT conversation';
+  await expectError(post({ messages: [{ role: 'user', content: 'x' }] }), 'no_chat');
+
+  // 409 id_conflict — the input id belongs to a different message.
+  fake.sendError = 'Message id already belongs to different input';
+  await expectError(post({ messages: [{ role: 'user', content: 'x' }] }), 'id_conflict');
+
+  // 503 queue_full — CoS itself is unavailable.
+  fake.sendError = 'The message queue is full';
+  await expectError(post({ messages: [{ role: 'user', content: 'x' }] }), 'queue_full');
+});
+
+test('GET /v1/models returns model cards with only the efforts CoS observed', async () => {
+  const fake = new FakeCos();
+  fake.catalog = {
+    state: 'ready',
+    requestedAt: null,
+    observedAt: 1_730_000_000_000,
+    models: [
+      { id: 'gpt-5.1', label: 'GPT-5.1', efforts: ['low', 'high'] },
+      { id: 'gpt-6', label: 'GPT-6', efforts: [] }
+    ]
+  };
+  const gateway = await startGateway(fake, gatewayConfigFromEnv({ GATEWAY_API_KEY: key }));
+  const reply = await fetch(`${base(gateway)}/v1/models`, { headers: authed });
+  assert.equal(reply.status, 200);
+  const body = (await reply.json()) as { data: Array<Record<string, unknown>> };
+  assert.equal(body.data.length, 2);
+
+  const card = body.data[0]!;
+  assert.deepEqual(card.efforts, ['low', 'high']);
+  assert.deepEqual(card, {
+    id: 'gpt-5.1',
+    object: 'model',
+    created: 1_730_000_000,
+    owned_by: 'chat-on-steroids',
+    efforts: ['low', 'high']
+  });
+  // CoS does not know a context window or a max-output figure; the card must
+  // not invent them (the task forbids it).
+  assert.equal('context_window' in card, false);
+  assert.equal('max_output_tokens' in card, false);
+  assert.equal('context_length' in card, false);
+
+  // A model with no observed efforts still answers; null effort means ChatGPT's
+  // composer auto lane, never an invented default effort.
+  assert.deepEqual(body.data[1]!.efforts, []);
 });

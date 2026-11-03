@@ -27,13 +27,13 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { foldDelta, foldFirst, FoldError, type NormalizedMessage } from './fold.js';
 import {
+  gatewayError,
   mapChatError,
   mapEndedWithoutAnswer,
   mapRefusal,
   mapSessionBusy,
   mapUndelivered,
-  type GatewayErrorData,
-  GatewayError
+  type GatewayErrorData
 } from './errors.js';
 import type { ChatModelCatalog, ReasoningEffort } from './catalog.js';
 
@@ -510,7 +510,7 @@ export class TurnManager {
       const expectedSession = info.sessionId ?? inputId;
       if (existing.sessionId !== expectedSession || existing.text !== plan.text ||
           existing.model !== selection.model || existing.reasoningEffort !== selection.reasoningEffort) {
-        throw new GatewayError(409, 'id_conflict', 'this id belongs to a different message');
+        throw gatewayError('id_conflict', 'this id belongs to a different message');
       }
       info.turnSeq = plan.seq;
       return { replayed: true, inputId, sessionId: existing.sessionId ?? inputId };
@@ -521,7 +521,7 @@ export class TurnManager {
       // gateway never consents to that (no interrupt parameter in v1).
       const policy = await this.internals.sessionInputPolicy(info.sessionId);
       if (policy.directTurn !== null && policy.directTurn !== undefined) {
-        throw new GatewayError(429, 'would_interrupt',
+        throw gatewayError('would_interrupt',
           'the chat is answering right now; retry once the turn ends', 5);
       }
     }
@@ -540,14 +540,14 @@ export class TurnManager {
     try {
       row = await this.internals.sendDesktopInput(input);
     } catch (error) {
-      throw mapRefusal(error) ?? new GatewayError(502, 'send_failed',
+      throw mapRefusal(error) ?? gatewayError('send_failed',
         error instanceof Error ? error.message : 'the send failed');
     }
     // The outbox decides for itself whether this send stops an answer. A turn
     // that began while the message was being admitted was never agreed to.
     if (row.directTurn !== null && row.directTurn !== undefined) {
       await this.internals.cancelInput(row.id);
-      throw new GatewayError(429, 'would_interrupt',
+      throw gatewayError('would_interrupt',
         'the chat began answering while the message was being admitted; it was withdrawn', 5);
     }
 
@@ -663,7 +663,7 @@ export class TurnManager {
   /** Follow the whole turn: anchor, then the answer for that turn's id. */
   async followTurn(info: SessionInfo, inputId: string): Promise<string> {
     const sessionId = info.sessionId;
-    if (sessionId === null) throw new GatewayError(502, 'no_session', 'no session to follow');
+    if (sessionId === null) throw gatewayError('no_session');
     const deadline = this.now() + this.turnTimeoutMs;
     const anchor = await this.findAnchor(sessionId, inputId, deadline);
     if (anchor === null) {

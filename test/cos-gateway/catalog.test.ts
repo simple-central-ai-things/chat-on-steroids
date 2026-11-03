@@ -6,7 +6,7 @@ import {
   REASONING_EFFORTS,
   type ChatModelCatalog
 } from '../../src/main/openai-gateway/catalog.js';
-import { GatewayError } from '../../src/main/openai-gateway/errors.js';
+import { GATEWAY_ERRORS } from '../../src/main/openai-gateway/errors.js';
 
 const ready: ChatModelCatalog = {
   state: 'ready',
@@ -26,11 +26,15 @@ test('the catalog maps to OpenAI model objects with plain ids', () => {
     id: 'gpt-5.1',
     object: 'model',
     created: 1_730_000_000,
-    owned_by: 'chat-on-steroids'
+    owned_by: 'chat-on-steroids',
+    efforts: ['minimal', 'low', 'medium', 'high']
   });
   for (const model of models) {
     assert.ok(!model.id.startsWith('cos/'), 'ids must not carry the cos/ prefix');
     assert.equal(model.object, 'model');
+    // A model card claims only what CoS observed: no invented context window or
+    // max-output figure (CoS does not know them). efforts is all we add.
+    assert.deepEqual(Object.keys(model).sort(), ['created', 'efforts', 'id', 'object', 'owned_by'].sort());
   }
 });
 
@@ -67,18 +71,20 @@ test('no model means ChatGPT keeps its own selection', () => {
 });
 
 test('unknown models and unavailable efforts are client errors', () => {
-  assert.throws(() => resolveModelChoice(ready, 'nope', null), (error: Error) => {
-    return error instanceof GatewayError && error.status === 400 && error.code === 'model_unknown';
-  });
-  assert.throws(() => resolveModelChoice(ready, 'gpt-5.1', 'pro'), (error: Error) => {
-    return error instanceof GatewayError && error.status === 400 && error.code === 'effort_unavailable';
-  });
+  const throwsAs = (code: string) => (error: Error) => {
+    const mapped = error as { status?: unknown; code?: unknown };
+    return mapped.status === GATEWAY_ERRORS[code as keyof typeof GATEWAY_ERRORS].status &&
+      mapped.code === code;
+  };
+  assert.throws(() => resolveModelChoice(ready, 'nope', null), throwsAs('model_unknown'));
+  assert.throws(() => resolveModelChoice(ready, 'gpt-5.1', 'pro'), throwsAs('effort_unavailable'));
 });
 
 test('a not-ready catalog is a 503, like /v1/models', () => {
   const pending: ChatModelCatalog = { ...ready, state: 'pending', error: undefined };
   assert.throws(() => resolveModelChoice(pending, 'gpt-5.1', 'high'), (error: Error) => {
-    return error instanceof GatewayError && error.status === 503 && error.code === 'models_unknown';
+    const mapped = error as { status?: unknown; code?: unknown };
+    return mapped.status === GATEWAY_ERRORS.models_unknown.status && mapped.code === 'models_unknown';
   });
 });
 

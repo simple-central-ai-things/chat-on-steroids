@@ -15,7 +15,7 @@
  * stays dependency-free and node:test-able; the semantics are pinned to
  * shared/chat-models.ts as of CoS v2.1.49.
  */
-import { GatewayError } from './errors.js';
+import { gatewayError } from './errors.js';
 
 /** CoS's reasoning-effort vocabulary (shared/session.ts REASONING_EFFORTS). */
 export const REASONING_EFFORTS = [
@@ -44,6 +44,14 @@ export interface OpenAiModel {
   object: 'model';
   created: number;
   owned_by: string;
+  /**
+   * The reasoning efforts this model offers, as CoS observed them from
+   * ChatGPT's picker. This is ALL the model card claims: no context window or
+   * max-output figure is invented here (CoS does not know them). A request
+   * that omits `reasoning_effort` (or sends null) does NOT pick one of these —
+   * it lets ChatGPT choose on its composer auto lane.
+   */
+  efforts: readonly ReasoningEffort[];
 }
 
 /** The picker catalog as an OpenAI model list; plain ids, no 'cos/' prefix. */
@@ -53,7 +61,8 @@ export function openAiModels(catalog: ChatModelCatalog): OpenAiModel[] {
     id: option.id,
     object: 'model' as const,
     created,
-    owned_by: 'chat-on-steroids'
+    owned_by: 'chat-on-steroids',
+    efforts: option.efforts
   }));
 }
 
@@ -98,15 +107,14 @@ export function resolveModelChoice(
     return { model: null, reasoningEffort: null };
   }
   if (catalog.state !== 'ready' || catalog.models.length === 0) {
-    throw new GatewayError(503, 'models_unknown',
-      'the app has not read this account\'s models yet; refresh them in the app');
+    throw gatewayError('models_unknown');
   }
   const choice = resolveChoice(catalog.models, model);
   if (choice === undefined) {
-    throw new GatewayError(400, 'model_unknown', 'GET /v1/models lists the models this account offers');
+    throw gatewayError('model_unknown');
   }
   if (effort !== undefined && effort !== null && !choice.efforts.includes(effort)) {
-    throw new GatewayError(400, 'effort_unavailable', choice.id + ' offers ' + choice.efforts.join(', '));
+    throw gatewayError('effort_unavailable', choice.id + ' offers ' + choice.efforts.join(', '));
   }
   return { model: choice.id, reasoningEffort: effort ?? null };
 }

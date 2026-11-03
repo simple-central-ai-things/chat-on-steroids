@@ -29,7 +29,7 @@ import { listInputs, sessionInputPolicy } from '../session/input.js';
 import { readSession, readSessionEvents } from '../session/read-model.js';
 import { onSessionChange } from '../session/recorder.js';
 import { getChatModels } from '../chat-models.js';
-import { externalBrowserProof } from '../browser-proof.js';
+import { externalBrowserProof, externalBrowserProofSince } from '../browser-proof.js';
 import { isPreferredBrowserRunning } from '../browser.js';
 import { externalExtensionFresh } from '../bridge.js';
 import type { SessionEventKind } from '../../shared/session.js';
@@ -52,7 +52,11 @@ export function createCosInternals(): CosInternals {
       sessionIds: change.sessionIds ?? []
     })),
     getChatModels: () => getChatModels(),
-    externalBrowserProof: () => externalBrowserProof(),
+    externalBrowserProof: () => {
+      const proof = externalBrowserProof();
+      if (proof === null) return null;
+      return { ...proof, since: externalBrowserProofSince() };
+    },
     liveChatGptEvidence: async () => {
       const [browserRunning, extensionFresh] = await Promise.all([
         isPreferredBrowserRunning(),
