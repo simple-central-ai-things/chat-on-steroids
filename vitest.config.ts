@@ -3,8 +3,8 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
-    // The SCGC gateway suite (node:test) runs under its own tsconfig and the
-    // scgc-gateway-tests workflow, not under vitest. The rest are vitest's
+    // The gateway suite (node:test) runs under its own tsconfig and the
+    // cos-gateway-tests workflow, not under vitest. The rest are vitest's
     // default excludes, which a custom exclude list would otherwise drop.
     exclude: [
       '**/node_modules/**',
@@ -12,7 +12,7 @@ export default defineConfig({
       '**/cypress/**',
       '**/.{idea,git,cache,output,temp}/**',
       '**/{karma,rollup,webpack,vite,vitest,jest,ava,babel,nyc,cypress,tsup,build,eslint,prettier}.config.*',
-      'test/scgc-gateway/**'
+      'test/cos-gateway/**'
     ],
     environment: 'node',
     // Real filesystem, real child processes and a real HTTP server, so the

@@ -11,21 +11,22 @@
  * distinct turns. The sequence is assigned once when the turn is planned
  * and persisted with the in-flight marker; only finishTurn consumes it.
  *
- * The mapping survives an app restart: it is kept as a whole JSON state map
- * under CoS's userData (every persist writes ALL conversations atomically),
- * and an in-flight turn persisted there is re-attached on the next request
- * (re-plan by input id, events after the anchor) instead of opening a fresh
- * chat or sending the message twice. The in-flight marker is cleared only
- * after the turn's outcome is known — a 504 timeout keeps it so the retry
- * re-attaches to the running turn.
+ * The mapping survives an app restart: it is persisted per conversation in
+ * the typed SQLite store (state/store.ts) under CoS's userData, together with
+ * one row per turn keyed by the stable turn id. An in-flight turn persisted
+ * there is re-attached on the next request (re-plan by turn id, events keyed
+ * by the anchor's native turn id) instead of opening a fresh chat or sending
+ * the message twice. The in-flight slot is cleared only after the turn's
+ * outcome is known — a 504 timeout keeps it so the retry re-attaches to the
+ * running turn.
  *
  * All CoS-internal calls arrive through the `CosInternals` interface, so
  * node:test exercises this module with stubs and no Electron process.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
 import { foldDelta, foldFirst, FoldError, type NormalizedMessage } from './fold.js';
+import { GatewayStateStore } from './state/store.js';
+import type { ConversationState } from './state/schema.js';
 import {
   gatewayError,
   mapChatError,
@@ -195,53 +196,21 @@ export class TurnError extends Error {
   }
 }
 
-/** Everything the gateway remembers about one conversation. */
-export interface SessionInfo {
-  sessionId: string | null;
-  sentUsers: number;
-  /** The derived input id of the turn still in flight, if any. */
-  turnInput: string | null;
-  turnStartedAt: number | null;
-  /**
-   * The per-conversation turn sequence. While a turn is in flight it names
-   * that turn (a retry re-derives the same input id from it); otherwise it
-   * is the next sequence to assign. A consumed sequence never comes back.
-   */
-  turnSeq: number;
-}
-
-interface SessionInfoJson {
-  session_id?: string | null;
-  sent_users?: number;
-  turn_input?: string | null;
-  turn_started?: number | null;
-  turn_seq?: number;
-}
-
-function encodeInfo(info: SessionInfo): SessionInfoJson {
-  return {
-    session_id: info.sessionId,
-    sent_users: info.sentUsers,
-    turn_input: info.turnInput,
-    turn_started: info.turnStartedAt,
-    turn_seq: info.turnSeq
-  };
-}
-
-function decodeInfo(raw: SessionInfoJson): SessionInfo {
-  return {
-    sessionId: typeof raw.session_id === 'string' ? raw.session_id : null,
-    sentUsers: typeof raw.sent_users === 'number' ? raw.sent_users : 0,
-    turnInput: typeof raw.turn_input === 'string' ? raw.turn_input : null,
-    turnStartedAt: typeof raw.turn_started === 'number' ? raw.turn_started : null,
-    turnSeq: typeof raw.turn_seq === 'number' ? raw.turn_seq : 0
-  };
-}
+/**
+ * Everything the gateway remembers about one conversation: the row the store
+ * persists (`ConversationState`), so the in-memory map and the database cannot
+ * disagree about the shape.
+ */
+export type SessionInfo = ConversationState;
 
 /**
  * A deterministic UUIDv5 for one logical turn, so retries replay, never
  * double-send. The per-conversation sequence keeps two legitimate identical
  * messages apart: same text, next sequence, fresh id.
+ *
+ * This id is the store's stable `turn_id`: the same retry re-derives it, so
+ * re-attachment is a lookup rather than a guess, and it is also the CoS outbox
+ * row id the gateway files.
  */
 export function turnInputId(
   key: string,
@@ -277,7 +246,7 @@ export interface TurnPlan {
 
 export class TurnManager {
   private readonly internals: CosInternals;
-  private readonly stateFile: string;
+  private readonly store: GatewayStateStore;
   private readonly turnTimeoutMs: number;
   private readonly queueWaitMs: number;
   private readonly pollMs: number;
@@ -291,12 +260,12 @@ export class TurnManager {
 
   constructor(internals: CosInternals, stateDir: string, options: TurnManagerOptions = {}) {
     this.internals = internals;
-    this.stateFile = path.join(stateDir, 'state.json');
     this.turnTimeoutMs = options.turnTimeoutMs ?? 600_000;
     this.queueWaitMs = options.queueWaitMs ?? 60_000;
     this.pollMs = options.pollMs ?? 250;
     this.refTimers = options.refTimers ?? false;
     this.now = options.now ?? Date.now;
+    this.store = GatewayStateStore.open({ dir: stateDir, now: this.now });
     this.unsubscribe = internals.onSessionChange((change) => this.wake(change.sessionIds));
   }
 
@@ -310,6 +279,7 @@ export class TurnManager {
   dispose(): void {
     this.unsubscribe?.();
     this.unsubscribe = null;
+    this.store.close();
   }
 
   // ------------------------------------------------------------- persistence
@@ -317,30 +287,44 @@ export class TurnManager {
   private ensureLoaded(): void {
     if (this.loaded) return;
     this.loaded = true;
-    try {
-      const raw = JSON.parse(readFileSync(this.stateFile, 'utf8')) as Record<string, unknown>;
-      for (const [key, info] of Object.entries(raw)) {
-        if (typeof info === 'object' && info !== null) this.states.set(key, decodeInfo(info as SessionInfoJson));
-      }
-    } catch {
-      // No state yet (or an unreadable file): start empty.
+    for (const [key, info] of this.store.loadConversations()) this.states.set(key, info);
+  }
+
+  /** The conversation key that owns this in-memory state, if it is tracked. */
+  private keyOf(info: SessionInfo): string | null {
+    for (const [key, candidate] of this.states) {
+      if (candidate === info) return key;
     }
+    return null;
+  }
+
+  /** Persist the conversation this state belongs to (full flush if untracked). */
+  private persistFor(info: SessionInfo): void {
+    const key = this.keyOf(info);
+    if (key === null) {
+      this.persist();
+      return;
+    }
+    this.persistConversation(key);
+  }
+
+  /** Persist one conversation; another conversation's row is never touched. */
+  private persistConversation(key: string): void {
+    this.ensureLoaded();
+    const info = this.states.get(key);
+    if (info === undefined) return;
+    this.store.saveConversation(key, info);
   }
 
   /**
-   * Persist the WHOLE session map atomically (tmp file + rename). Persisting
-   * one conversation must never drop another's mapping — a concurrent
-   * conversation's state is written alongside the changed one.
+   * Persist every known conversation in one transaction. Kept for the paths
+   * that hold state rather than a key (a full flush on settle/exit); the hot
+   * paths write their own conversation only.
    */
   persist(): void {
     this.ensureLoaded();
     if (this.states.size === 0) return;
-    mkdirSync(path.dirname(this.stateFile), { recursive: true });
-    const payload: Record<string, SessionInfoJson> = {};
-    for (const [key, info] of this.states) payload[key] = encodeInfo(info);
-    const tmp = this.stateFile + '.tmp';
-    writeFileSync(tmp, JSON.stringify(payload, null, 1));
-    renameSync(tmp, this.stateFile);
+    this.store.saveAll(this.states);
   }
 
   // ------------------------------------------------------------------- locks
@@ -390,16 +374,20 @@ export class TurnManager {
     const release = await this.acquireLock(key);
     try {
       // The session may be gone from CoS; a live one keeps its history.
-      // A gone session leaves nothing to re-attach to: clear the marker.
+      // A gone session leaves nothing to re-attach to: clear the slot.
       if (info.sessionId !== null) {
         const detail = await this.internals.readSession(info.sessionId);
         if (detail === null || detail === undefined) {
+          const abandoned = info.turnInput;
           info.sessionId = null;
           info.turnInput = null;
           info.turnStartedAt = null;
+          if (abandoned !== null) {
+            this.store.recordTurnOutcome(abandoned, 'settled', { error: 'the CoS session is gone' });
+          }
         }
       }
-      this.persist();
+      this.persistConversation(key);
       return { info, release };
     } catch (error) {
       release();
@@ -416,6 +404,7 @@ export class TurnManager {
    */
   async settleLeftover(info: SessionInfo): Promise<void> {
     if (info.turnInput === null || info.sessionId === null) return;
+    const settled = info.turnInput;
     try {
       await this.settle(info);
     } catch (error) {
@@ -424,7 +413,8 @@ export class TurnManager {
     }
     info.turnInput = null;
     info.turnStartedAt = null;
-    this.persist();
+    this.store.recordTurnOutcome(settled, 'settled');
+    this.persistFor(info);
   }
 
   /** Wait out an in-flight turn left behind by a restart or a timeout. */
@@ -483,10 +473,12 @@ export class TurnManager {
    * retry re-attaches to the running turn instead of re-sending.
    */
   finishTurn(info: SessionInfo): void {
+    const settled = info.turnInput;
     info.turnInput = null;
     info.turnStartedAt = null;
     info.turnSeq += 1;
-    this.persist();
+    if (settled !== null) this.store.recordTurnOutcome(settled, 'settled');
+    this.persistFor(info);
   }
 
   // -------------------------------------------------------------------- send
@@ -513,6 +505,8 @@ export class TurnManager {
         throw gatewayError('id_conflict', 'this id belongs to a different message');
       }
       info.turnSeq = plan.seq;
+      this.store.noteTurnAttempt(inputId);
+      this.persistFor(info);
       return { replayed: true, inputId, sessionId: existing.sessionId ?? inputId };
     }
 
@@ -555,10 +549,20 @@ export class TurnManager {
     info.sentUsers += 1;
     info.turnInput = inputId;
     // The in-flight turn's sequence, persisted so a retry re-derives the
-    // same input id instead of opening a second send.
+    // same turn id instead of opening a second send.
     info.turnSeq = plan.seq;
     info.turnStartedAt = this.now();
-    this.persist();
+    const key = this.keyOf(info);
+    if (key !== null) {
+      this.store.beginTurn({
+        turnId: inputId,
+        conversationKey: key,
+        seq: plan.seq,
+        sessionId: info.sessionId,
+        startedAt: info.turnStartedAt
+      });
+    }
+    this.persistFor(info);
     return { replayed: false, inputId, sessionId: info.sessionId };
   }
 
@@ -665,12 +669,31 @@ export class TurnManager {
     const sessionId = info.sessionId;
     if (sessionId === null) throw gatewayError('no_session');
     const deadline = this.now() + this.turnTimeoutMs;
-    const anchor = await this.findAnchor(sessionId, inputId, deadline);
-    if (anchor === null) {
-      const row = (await this.internals.listInputs()).find((candidate) => candidate.id === inputId);
-      throw mapUndelivered(row?.error);
+    try {
+      const anchor = await this.findAnchor(sessionId, inputId, deadline);
+      if (anchor === null) {
+        const row = (await this.internals.listInputs()).find((candidate) => candidate.id === inputId);
+        throw mapUndelivered(row?.error);
+      }
+      // CoS's own turn id is evidence for the keyed follow, not the store key.
+      if (anchor.turnId !== undefined && anchor.turnId !== '') {
+        this.store.recordNativeTurnId(inputId, anchor.turnId);
+      }
+      const answer = (await this.waitTurn(sessionId, anchor.seq + 1, deadline, true, anchor.turnId)) ?? '';
+      this.store.recordTurnOutcome(inputId, 'answered');
+      return answer;
+    } catch (error) {
+      // A timeout is not a terminal outcome: the turn keeps running and the
+      // slot stays, so the next request re-attaches. Everything else is final.
+      if (error instanceof TurnTimeout) {
+        this.store.recordTurnOutcome(inputId, 'timeout');
+      } else {
+        this.store.recordTurnOutcome(inputId, 'failed', {
+          error: error instanceof Error ? error.message : 'the turn failed'
+        });
+      }
+      throw error;
     }
-    return (await this.waitTurn(sessionId, anchor.seq + 1, deadline, true, anchor.turnId)) ?? '';
   }
 
   /** A wait timer that is unref'd unless the manager was told to hold the loop. */

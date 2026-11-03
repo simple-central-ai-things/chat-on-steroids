@@ -14,6 +14,7 @@ import {
 } from '../../src/main/openai-gateway/turns.js';
 import { GatewayError } from '../../src/main/openai-gateway/errors.js';
 import { normalizeMessages } from '../../src/main/openai-gateway/fold.js';
+import { SHADOW_STATE_FILE } from '../../src/main/openai-gateway/state/legacy-json.js';
 import { FakeCos, deliverTurn } from './fake-cos.js';
 
 const stateDir = (): string => mkdtempSync(path.join(tmpdir(), 'cos-gateway-test-'));
@@ -374,7 +375,7 @@ test('persisting one conversation keeps the other conversations', async () => {
   const b = await manager.acquire('conv-b');
   const sentA = await sendPlain(manager, 'conv-a', a.info, 'first-a');
   const sentB = await sendPlain(manager, 'conv-b', b.info, 'first-b');
-  const persisted = JSON.parse(readFileSync(path.join(dir, 'state.json'), 'utf8')) as Record<string, {
+  const persisted = JSON.parse(readFileSync(path.join(dir, SHADOW_STATE_FILE), 'utf8')) as Record<string, {
     session_id: string | null;
     turn_input: string | null;
   }>;
@@ -411,7 +412,7 @@ test('finishTurn clears the in-flight slot and persists the mapping', async () =
   assert.equal(info.turnInput, sent.inputId);
   manager.finishTurn(info);
   assert.equal(info.turnInput, null);
-  const persisted = JSON.parse(readFileSync(path.join(dir, 'state.json'), 'utf8')) as Record<string, {
+  const persisted = JSON.parse(readFileSync(path.join(dir, SHADOW_STATE_FILE), 'utf8')) as Record<string, {
     session_id: string | null;
     turn_input: string | null;
     sent_users: number;
