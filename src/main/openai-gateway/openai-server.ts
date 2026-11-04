@@ -32,6 +32,7 @@ import {
 import {
   completionId,
   SessionBusy,
+  TurnDetached,
   TurnError,
   TurnManager,
   TurnTimeout,
@@ -40,6 +41,7 @@ import {
   type TurnManagerOptions,
   type TurnPlan
 } from './turns.js';
+import { completionChunk, SseWriter, STREAM_DONE } from './sse.js';
 
 export const PROTOCOL = 'cos-embedded-1';
 const MAX_BODY_BYTES = 1_000_000;
@@ -49,6 +51,8 @@ export interface GatewayConfig {
   apiKey: string | null;
   turnTimeoutSeconds: number;
   includeSystem: boolean;
+  /** SSE comment interval while a streamed turn records nothing; 0 disables. */
+  streamHeartbeatMs: number;
 }
 
 export function gatewayConfigFromEnv(env: NodeJS.ProcessEnv): GatewayConfig {
@@ -58,13 +62,19 @@ export function gatewayConfigFromEnv(env: NodeJS.ProcessEnv): GatewayConfig {
   const timeoutRaw = env.TURN_TIMEOUT_SECONDS;
   const turnTimeoutSeconds =
     timeoutRaw !== undefined && timeoutRaw !== '' ? Number.parseInt(timeoutRaw, 10) : 600;
+  const heartbeatRaw = env.STREAM_HEARTBEAT_SECONDS;
+  const heartbeatSeconds =
+    heartbeatRaw !== undefined && heartbeatRaw !== '' ? Number.parseInt(heartbeatRaw, 10) : 15;
   return {
     port: Number.isSafeInteger(port) && port >= 0 && port < 65536 ? port : 8793,
     apiKey: apiKey !== undefined && apiKey.length > 0 ? apiKey : null,
     turnTimeoutSeconds: Number.isSafeInteger(turnTimeoutSeconds) && turnTimeoutSeconds > 0
       ? turnTimeoutSeconds
       : 600,
-    includeSystem: env.GATEWAY_INCLUDE_SYSTEM !== '0' && env.GATEWAY_INCLUDE_SYSTEM !== 'false'
+    includeSystem: env.GATEWAY_INCLUDE_SYSTEM !== '0' && env.GATEWAY_INCLUDE_SYSTEM !== 'false',
+    streamHeartbeatMs: Number.isSafeInteger(heartbeatSeconds) && heartbeatSeconds > 0
+      ? heartbeatSeconds * 1000
+      : 0
   };
 }
 
@@ -99,6 +109,13 @@ export function startOpenAiServer(
     void handleRequest(req, res, internals, config, manager).catch((error: unknown) => {
       const failure = asErrorData(error);
       log(`gateway ${req.method} ${req.url} failed: ${failure.code}: ${failure.message}`);
+      if (res.headersSent) {
+        // A streamed answer already began, so the status line is gone. The
+        // streaming path reports its own failures as an SSE error frame; this
+        // only makes sure a late throw cannot be answered with a second head.
+        res.end();
+        return;
+      }
       send(res, failure.status, errorBody(failure), failure.retryAfterSeconds);
     });
   });
@@ -296,7 +313,9 @@ async function handleCompletions(
       }
     })();
 
-  // v1 ignores `stream`: the turn is followed to completion and answered whole.
+  // `stream: true` answers with OpenAI `chat.completion.chunk` events on the
+  // same turn path; anything else (including a non-boolean) answers whole.
+  const streaming = body.stream === true;
   if (body.reasoning_effort !== undefined && body.reasoning_effort !== null &&
       !isReasoningEffort(body.reasoning_effort)) {
     throw gatewayError('invalid_reasoning_effort',
@@ -328,12 +347,12 @@ async function handleCompletions(
       if (error instanceof FoldError) throw gatewayError('invalid_body', error.message);
       throw error;
     }
-    let answer: string;
+    let inputId: string;
     if (plan.replaying) {
       // A timed-out or restart-left turn: re-attach by input id. Never
       // re-sent and never re-folded; the persisted marker clears only once
       // the outcome is known (finishTurn inside followAnswer).
-      answer = await followAnswer(manager, info, plan.inputId, config.turnTimeoutSeconds);
+      inputId = plan.inputId;
     } else {
       if (info.turnInput !== null) {
         // A DIFFERENT turn is still running for this conversation (a 504 or
@@ -341,8 +360,14 @@ async function handleCompletions(
         await busyAsError(manager.settleLeftover(info));
       }
       const sent = await manager.sendTurn(info, plan, selection);
-      answer = await followAnswer(manager, info, sent.inputId, config.turnTimeoutSeconds);
+      inputId = sent.inputId;
     }
+    // Everything above answers a JSON error, because nothing was written yet.
+    if (streaming) {
+      await streamAnswer(res, manager, info, inputId, config, body);
+      return;
+    }
+    const answer = await followAnswer(manager, info, inputId, config.turnTimeoutSeconds);
     const now = Math.floor(Date.now() / 1000);
     send(res, 200, {
       id: completionId(),
@@ -354,6 +379,67 @@ async function handleCompletions(
     });
   } finally {
     release();
+  }
+}
+
+/**
+ * Answer one turn as OpenAI `chat.completion.chunk` SSE events.
+ *
+ * Frames: one role chunk, one content chunk per answer revision suffix as CoS
+ * records it, one empty chunk with `finish_reason: 'stop'`, then `[DONE]`.
+ * Failures that happen after the first byte cannot be a status code any more,
+ * so they become one `data: {"error": …}` frame and the stream ends without
+ * `[DONE]` — an OpenAI client treats that as a failed stream, never as a
+ * complete answer.
+ *
+ * A client that goes away stops the follow within one poll (the socket close
+ * wakes the waiter) and leaves the persisted turn marker in place, exactly
+ * like a 504: the CoS turn keeps running, nothing is recorded as failed, and
+ * the next request re-attaches by input id instead of sending twice.
+ */
+async function streamAnswer(
+  res: ServerResponse,
+  manager: TurnManager,
+  info: SessionInfo,
+  inputId: string,
+  config: GatewayConfig,
+  body: CompletionRequest,
+): Promise<void> {
+  const meta = {
+    id: completionId(),
+    created: Math.floor(Date.now() / 1000),
+    model: typeof body.model === 'string' ? body.model : 'auto'
+  };
+  const sessionId = info.sessionId;
+  const writer = new SseWriter(res, sessionId === null
+    ? {}
+    : { onDisconnect: () => manager.wake([sessionId]) });
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    // no-transform keeps a proxy from buffering the answer; X-Accel-Buffering
+    // is the same request for nginx-fronted gateways.
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.flushHeaders?.();
+  writer.startHeartbeat(config.streamHeartbeatMs);
+  try {
+    await writer.send(completionChunk(meta, { role: 'assistant', content: '' }));
+    await manager.followTurn(info, inputId, {
+      onText: (update) => writer.send(completionChunk(meta, { content: update.delta })),
+      cancelled: () => writer.disconnected
+    });
+    manager.finishTurn(info);
+    await writer.send(completionChunk(meta, {}, 'stop'));
+    await writer.raw(STREAM_DONE);
+  } catch (error) {
+    const outcome = settleFollowFailure(manager, info, error, config.turnTimeoutSeconds);
+    if (outcome.kind === 'failed' && !writer.disconnected) {
+      await writer.send(errorBody(outcome.error));
+    }
+  } finally {
+    await writer.close();
   }
 }
 
@@ -402,16 +488,40 @@ async function followAnswer(
     manager.finishTurn(info);
     return answer;
   } catch (error) {
-    if (error instanceof TurnTimeout) {
-      // The turn keeps running; the persisted slot lets the next request re-attach.
-      throw mapTurnTimeout(turnTimeoutSeconds);
+    const outcome = settleFollowFailure(manager, info, error, turnTimeoutSeconds);
+    if (outcome.kind === 'detached') {
+      // Without a streaming caller nothing can detach; keep the contract total.
+      throw gatewayError('internal');
     }
-    if (error instanceof TurnError) {
-      manager.finishTurn(info);
-      throw error.toError();
-    }
-    throw error instanceof GatewayError ? error : gatewayError('internal');
+    throw outcome.error;
   }
+}
+
+/**
+ * The one place a followed turn's failure decides the marker's fate, shared by
+ * the whole-answer and streaming paths so they can never disagree:
+ *
+ *  - a timeout or a client disconnect keeps the persisted slot (re-attachable),
+ *  - a reported chat failure or a turn that ended without an answer clears it,
+ *  - anything else is a gateway-internal 502.
+ */
+function settleFollowFailure(
+  manager: TurnManager,
+  info: SessionInfo,
+  error: unknown,
+  turnTimeoutSeconds: number,
+): { kind: 'detached' } | { kind: 'failed'; error: GatewayErrorData } {
+  if (error instanceof TurnDetached) return { kind: 'detached' };
+  if (error instanceof TurnTimeout) {
+    // The turn keeps running; the persisted slot lets the next request re-attach.
+    return { kind: 'failed', error: mapTurnTimeout(turnTimeoutSeconds) };
+  }
+  if (error instanceof TurnError) {
+    manager.finishTurn(info);
+    return { kind: 'failed', error: error.toError() };
+  }
+  if (error instanceof GatewayError) return { kind: 'failed', error };
+  return { kind: 'failed', error: gatewayError('internal') };
 }
 
 export type { ChatModelCatalog };

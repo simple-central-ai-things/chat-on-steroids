@@ -9,7 +9,7 @@ import {
   startOpenAiServer,
   type OpenAiServer
 } from '../../src/main/openai-gateway/openai-server.js';
-import { FakeCos, deliverTurn } from './fake-cos.js';
+import { FakeCos, deliverAnchor, deliverRevision, deliverTurn, endTurn } from './fake-cos.js';
 import type { ChatModelCatalog } from '../../src/main/openai-gateway/catalog.js';
 import { GATEWAY_ERRORS } from '../../src/main/openai-gateway/errors.js';
 
@@ -98,8 +98,7 @@ test('chat completions run a full turn and answer in OpenAI shape', async () => 
       { role: 'system', content: 'Be brief.' },
       { role: 'user', content: 'Say hi' }
     ],
-    reasoning_effort: 'high',
-    stream: true
+    reasoning_effort: 'high'
   };
   // Answer as soon as the message is admitted, like CoS delivering a turn.
   const replyPromise = fetch(`${base(gateway)}/v1/chat/completions`, {
@@ -464,4 +463,258 @@ test('GET /v1/models returns model cards with only the efforts CoS observed', as
   // A model with no observed efforts still answers; null effort means ChatGPT's
   // composer auto lane, never an invented default effort.
   assert.deepEqual(body.data[1]!.efforts, []);
+});
+
+// --------------------------------------------------------------------------
+// Streaming completions (`stream: true`): OpenAI chat.completion.chunk events
+// on the same turn path, with cancellation and re-attachment preserved.
+// --------------------------------------------------------------------------
+
+const SSE_ACCEPT = { ...authed, 'content-type': 'application/json' };
+
+interface Chunk {
+  id: string;
+  object: string;
+  created: number;
+  model: string;
+  choices: Array<{
+    index: number;
+    delta: { role?: string; content?: string };
+    logprobs: unknown;
+    finish_reason: string | null;
+  }>;
+}
+
+interface ParsedSse {
+  chunks: Array<Chunk | { error: { code: string; message: string; type: string } }>;
+  done: boolean;
+  comments: string[];
+}
+
+/** Split an SSE body into its JSON frames, the [DONE] marker and comments. */
+function parseSse(body: string): ParsedSse {
+  const chunks: ParsedSse['chunks'] = [];
+  const comments: string[] = [];
+  let done = false;
+  for (const frame of body.split('\n\n')) {
+    if (frame.trim() === '') continue;
+    if (frame.startsWith(':')) {
+      comments.push(frame.replace(/^:\s*/, ''));
+      continue;
+    }
+    const line = frame.split('\n').find((row) => row.startsWith('data: '));
+    if (line === undefined) continue;
+    const payload = line.slice('data: '.length);
+    if (payload.trim() === '[DONE]') {
+      done = true;
+      continue;
+    }
+    chunks.push(JSON.parse(payload) as ParsedSse['chunks'][number]);
+  }
+  return { chunks, done, comments };
+}
+
+const contentOf = (frames: ParsedSse): string =>
+  frames.chunks
+    .flatMap((chunk) => ('choices' in chunk ? chunk.choices[0]?.delta.content ?? [] : []))
+    .join('');
+
+test('stream: true answers in-order chat.completion.chunk events', async () => {
+  const fake = new FakeCos();
+  fake.catalog = readyCatalog;
+  const gateway = await startGateway(fake, gatewayConfigFromEnv({ GATEWAY_API_KEY: key }));
+
+  const replyPromise = fetch(`${base(gateway)}/v1/chat/completions`, {
+    method: 'POST',
+    headers: SSE_ACCEPT,
+    body: JSON.stringify({
+      model: 'gpt-5.1',
+      messages: [{ role: 'user', content: 'Say hi' }],
+      stream: true
+    })
+  });
+  await waitFor(() => fake.sent.length === 1);
+  deliverTurn(fake, fake.sent[0]!.id, 'Hi there');
+
+  const reply = await replyPromise;
+  assert.equal(reply.status, 200);
+  assert.match(reply.headers.get('content-type') ?? '', /^text\/event-stream/);
+  const frames = parseSse(await reply.text());
+  assert.equal(frames.done, true, 'the stream ends with [DONE]');
+
+  const chunks = frames.chunks as Chunk[];
+  assert.equal(chunks.length, 3, 'one role chunk, one content chunk, one finish chunk');
+  const id = chunks[0]!.id;
+  for (const chunk of chunks) {
+    assert.equal(chunk.object, 'chat.completion.chunk');
+    assert.equal(chunk.id, id, 'every chunk of one turn shares its id');
+    assert.equal(chunk.model, 'gpt-5.1');
+    assert.equal(typeof chunk.created, 'number');
+    assert.equal(chunk.choices.length, 1);
+    assert.equal(chunk.choices[0]!.index, 0);
+    assert.equal(chunk.choices[0]!.logprobs, null);
+  }
+  assert.deepEqual(chunks[0]!.choices[0]!.delta, { role: 'assistant', content: '' });
+  assert.equal(chunks[0]!.choices[0]!.finish_reason, null);
+  assert.deepEqual(chunks[1]!.choices[0]!.delta, { content: 'Hi there' });
+  assert.equal(chunks[1]!.choices[0]!.finish_reason, null);
+  assert.deepEqual(chunks[2]!.choices[0]!.delta, {});
+  assert.equal(chunks[2]!.choices[0]!.finish_reason, 'stop');
+});
+
+test('each answer revision streams only its new suffix, matching the whole answer', async () => {
+  const fake = new FakeCos();
+  fake.catalog = readyCatalog;
+  const gateway = await startGateway(fake, gatewayConfigFromEnv({ GATEWAY_API_KEY: key }));
+  const url = `${base(gateway)}/v1/chat/completions`;
+  const messages = [{ role: 'user', content: 'Say hi' }];
+
+  const streamed = fetch(url, {
+    method: 'POST',
+    headers: SSE_ACCEPT,
+    body: JSON.stringify({ messages, stream: true })
+  });
+  await waitFor(() => fake.sent.length === 1);
+  const inputId = fake.sent[0]!.id;
+  deliverAnchor(fake, inputId);
+  // CoS re-records one growing message under one id: three revisions.
+  deliverRevision(fake, inputId, 'msg-1', 'Hi');
+  deliverRevision(fake, inputId, 'msg-1', 'Hi there');
+  deliverRevision(fake, inputId, 'msg-1', 'Hi there!', { final: true });
+  endTurn(fake, inputId);
+
+  const frames = parseSse(await (await streamed).text());
+  const contents = (frames.chunks as Chunk[])
+    .map((chunk) => chunk.choices[0]?.delta.content)
+    .filter((text): text is string => typeof text === 'string' && text !== '');
+  assert.deepEqual(contents, ['Hi', ' there', '!'], 'each revision contributes only its suffix');
+  assert.equal(contentOf(frames), 'Hi there!');
+  assert.equal(frames.done, true);
+
+  // The same completed turn asked without `stream` answers the same content.
+  const whole = fetch(url, {
+    method: 'POST',
+    headers: SSE_ACCEPT,
+    body: JSON.stringify({ messages })
+  });
+  await waitFor(() => fake.sent.length === 2);
+  deliverTurn(fake, fake.sent[1]!.id, 'Hi there!');
+  const json = (await (await whole).json()) as { choices: Array<{ message: { content: string } }> };
+  assert.equal(json.choices[0]?.message.content, contentOf(frames), 'SSE and JSON agree');
+});
+
+test('a mid-stream client disconnect stops the follow and keeps the turn re-attachable', async () => {
+  const fake = new FakeCos();
+  fake.catalog = readyCatalog;
+  const gateway = await startGateway(fake, gatewayConfigFromEnv({ GATEWAY_API_KEY: key }));
+  const url = `${base(gateway)}/v1/chat/completions`;
+  const payload = { messages: [{ role: 'user', content: 'Long one' }], stream: true };
+
+  const controller = new AbortController();
+  const replyPromise = fetch(url, {
+    method: 'POST', headers: SSE_ACCEPT, body: JSON.stringify(payload), signal: controller.signal
+  });
+  await waitFor(() => fake.sent.length === 1);
+  const inputId = fake.sent[0]!.id;
+  deliverAnchor(fake, inputId);
+  deliverRevision(fake, inputId, 'msg-1', 'Half');
+
+  const reply = await replyPromise;
+  assert.equal(reply.status, 200);
+  const reader = reply.body!.getReader();
+  const decoder = new TextDecoder();
+  let seen = '';
+  while (!seen.includes('Half')) {
+    const { value, done } = await reader.read();
+    assert.equal(done, false, 'the stream stays open until the turn ends');
+    if (value !== undefined) seen += decoder.decode(value, { stream: true });
+  }
+
+  await reader.cancel().catch(() => undefined);
+  controller.abort();
+  // Gone means gone: the follower stops within a poll, it does not keep
+  // reading CoS's journal for a caller that no longer listens.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const readsAfterAbort = fake.readSessionEventsCalls;
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.ok(
+    fake.readSessionEventsCalls - readsAfterAbort <= 2,
+    `the follow stopped after the disconnect (${fake.readSessionEventsCalls - readsAfterAbort} extra reads)`
+  );
+
+  // The turn kept running in ChatGPT and its answer was recorded; the retry
+  // re-attaches to that turn instead of sending the message a second time.
+  deliverRevision(fake, inputId, 'msg-1', 'Half and half', { final: true });
+  endTurn(fake, inputId);
+  const retry = await fetch(url, {
+    method: 'POST', headers: SSE_ACCEPT, body: JSON.stringify({ messages: payload.messages })
+  });
+  assert.equal(retry.status, 200);
+  const json = (await retry.json()) as { choices: Array<{ message: { content: string } }> };
+  assert.equal(json.choices[0]?.message.content, 'Half and half');
+  assert.equal(fake.sent.length, 1, 'the retry re-attached by input id');
+});
+
+test('a streamed turn that times out sends an error frame and the retry re-attaches', async () => {
+  const fake = new FakeCos();
+  fake.catalog = readyCatalog;
+  const gateway = await startGateway(fake, gatewayConfigFromEnv({ GATEWAY_API_KEY: key }), 120);
+  const url = `${base(gateway)}/v1/chat/completions`;
+  const payload = { messages: [{ role: 'user', content: 'Slow' }], stream: true };
+
+  const first = fetch(url, { method: 'POST', headers: SSE_ACCEPT, body: JSON.stringify(payload) });
+  await waitFor(() => fake.sent.length === 1);
+  const timedOut = await first;
+  assert.equal(timedOut.status, 200, 'the status line left before the turn failed');
+  const failed = parseSse(await timedOut.text());
+  assert.equal(failed.done, false, 'a failed stream never ends with [DONE]');
+  const error = failed.chunks.at(-1) as { error: { code: string } };
+  assert.equal(error.error.code, 'turn_timeout');
+
+  // The turn keeps running; the retry streams the late answer, never re-sends.
+  const retry = fetch(url, { method: 'POST', headers: SSE_ACCEPT, body: JSON.stringify(payload) });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  deliverTurn(fake, fake.sent[0]!.id, 'finally');
+  const replied = await retry;
+  assert.equal(replied.status, 200);
+  const frames = parseSse(await replied.text());
+  assert.equal(frames.done, true);
+  assert.equal(contentOf(frames), 'finally');
+  assert.equal(fake.sent.length, 1, 'the retry re-attached by input id');
+});
+
+test('a request that fails before the stream opens still answers JSON', async () => {
+  const fake = new FakeCos();
+  fake.catalog = readyCatalog;
+  const gateway = await startGateway(fake, gatewayConfigFromEnv({ GATEWAY_API_KEY: key }));
+  const reply = await fetch(`${base(gateway)}/v1/chat/completions`, {
+    method: 'POST',
+    headers: SSE_ACCEPT,
+    body: JSON.stringify({
+      model: 'nope', messages: [{ role: 'user', content: 'x' }], stream: true
+    })
+  });
+  assert.equal(reply.status, 400);
+  assert.match(reply.headers.get('content-type') ?? '', /^application\/json/);
+  const body = (await reply.json()) as { error: { code: string } };
+  assert.equal(body.error.code, 'model_unknown');
+});
+
+test('a non-boolean stream value keeps the whole-answer JSON reply', async () => {
+  const fake = new FakeCos();
+  fake.catalog = readyCatalog;
+  const gateway = await startGateway(fake, gatewayConfigFromEnv({ GATEWAY_API_KEY: key }));
+  const replyPromise = fetch(`${base(gateway)}/v1/chat/completions`, {
+    method: 'POST',
+    headers: SSE_ACCEPT,
+    body: JSON.stringify({
+      messages: [{ role: 'user', content: 'Say hi' }], stream: 'yes'
+    })
+  });
+  await waitFor(() => fake.sent.length === 1);
+  deliverTurn(fake, fake.sent[0]!.id, 'whole');
+  const reply = await replyPromise;
+  assert.equal(reply.status, 200);
+  const body = (await reply.json()) as { object: string };
+  assert.equal(body.object, 'chat.completion');
 });

@@ -94,6 +94,7 @@ export class FakeCos implements CosInternals {
     sessionId: string,
     options: { from: number; kinds: readonly string[]; limit?: number },
   ): Promise<CosEventsPage | null> {
+    this.readSessionEventsCalls += 1;
     const events = this.sessions.get(sessionId);
     if (events === undefined) return null;
     const limit = options.limit ?? Number.MAX_SAFE_INTEGER;
@@ -137,6 +138,67 @@ export class FakeCos implements CosInternals {
   liveChatGptEvidence(): Promise<{ browserRunning: boolean | null; extensionFresh: boolean | null }> {
     return Promise.resolve({ ...this.liveEvidence });
   }
+
+  /** How many event reads the gateway made (streaming must stop on disconnect). */
+  readSessionEventsCalls = 0;
+}
+
+/** The session a delivered input belongs to (a new chat's id is its input id). */
+function sessionOf(fake: FakeCos, inputId: string): string {
+  const row = fake.inputs.get(inputId);
+  if (row === undefined) throw new Error(`sessionOf: unknown input id ${inputId}`);
+  return row.sessionId!;
+}
+
+/** The turn's own anchor row, optionally tagged with ChatGPT's turn id. */
+export function deliverAnchor(fake: FakeCos, inputId: string, turnId?: string): void {
+  const sessionId = sessionOf(fake, inputId);
+  fake.appendEvent(sessionId, {
+    kind: 'user_message',
+    message: { text: '...' },
+    inputId,
+    ...(turnId === undefined ? {} : { turnId })
+  });
+  fake.notify(sessionId);
+}
+
+/**
+ * One revision of an answer message, the way CoS records a growing reply: the
+ * same message id, the whole text so far, `final` only on the last revision.
+ */
+export function deliverRevision(
+  fake: FakeCos,
+  inputId: string,
+  messageId: string,
+  text: string,
+  options: { final?: boolean; turnId?: string } = {},
+): void {
+  const sessionId = sessionOf(fake, inputId);
+  fake.appendEvent(sessionId, {
+    kind: 'assistant_message',
+    messageId,
+    state: options.final === true ? 'final' : 'streaming',
+    final: options.final === true,
+    message: { text },
+    ...(options.turnId === undefined ? {} : { turnId: options.turnId })
+  });
+  fake.notify(sessionId);
+}
+
+/** The turn's boundary row. */
+export function endTurn(
+  fake: FakeCos,
+  inputId: string,
+  outcome: string = 'completed',
+  turnId?: string,
+): void {
+  const sessionId = sessionOf(fake, inputId);
+  fake.appendEvent(sessionId, {
+    kind: 'turn_end',
+    outcome,
+    ...(turnId === undefined ? {} : { turnId })
+  });
+  fake.notify(sessionId);
 }
 
 /** Deliver a full turn for an admitted input, the way CoS would. */
@@ -146,9 +208,7 @@ export function deliverTurn(
   answer: string,
   outcome: string = 'completed',
 ): void {
-  const row = fake.inputs.get(inputId);
-  if (row === undefined) throw new Error('deliverTurn: unknown input id');
-  const sessionId = row.sessionId!;
+  const sessionId = sessionOf(fake, inputId);
   fake.appendEvent(sessionId, { kind: 'user_message', message: { text: '...' }, inputId });
   fake.appendEvent(sessionId, { kind: 'assistant_message', final: true, message: { text: answer } });
   fake.appendEvent(sessionId, { kind: 'turn_end', outcome });

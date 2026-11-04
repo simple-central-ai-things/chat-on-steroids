@@ -22,6 +22,12 @@
  *
  * All CoS-internal calls arrive through the `CosInternals` interface, so
  * node:test exercises this module with stubs and no Electron process.
+ *
+ * Streaming (`stream: true`) does not open a second turn path: it is the same
+ * follow, with `TurnFollowHooks.onText` reporting each revision of the answer
+ * as CoS records it. A client that goes away is a `TurnDetached`, which leaves
+ * the in-flight marker exactly as a 504 does, so the message is never sent
+ * twice and a later request re-attaches by input id.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { foldDelta, foldFirst, FoldError, type NormalizedMessage } from './fold.js';
@@ -75,6 +81,10 @@ export interface CosEvent {
   /** ChatGPT's own turn id when the extension could read it (BaseEvent.turnId). */
   turnId?: string;
   final?: boolean;
+  /** ChatGPT's message id: one answer revision keeps it across revisions. */
+  messageId?: string;
+  /** 'streaming' until the answer is final (recorder.ts assistant_message). */
+  state?: string;
   message?: { text?: string };
   retryAt?: number;
   recoverable?: boolean;
@@ -194,6 +204,37 @@ export class TurnError extends Error {
       ? mapEndedWithoutAnswer(this.outcome)
       : mapChatError({ message: { text: this.message }, retryAt: this.retryAt, recoverable: this.recoverable }, Date.now());
   }
+}
+
+/**
+ * The client stopped waiting for this turn (an SSE response was closed by the
+ * caller). Distinct from Timeout: nobody is asking for the answer any more,
+ * so nothing is recorded as a failure and the in-flight marker stays exactly
+ * like a 504 — the next request re-attaches by input id instead of re-sending.
+ */
+export class TurnDetached extends Error {
+  constructor(message = 'the client stopped waiting for the turn') {
+    super(message);
+    this.name = 'TurnDetached';
+  }
+}
+
+/** One answer increment: only text the caller has not been told yet. */
+export interface TurnTextUpdate {
+  /** ChatGPT's message id, '' for a legacy row that carried none. */
+  messageId: string;
+  /** The new text of this revision (never text already reported). */
+  delta: string;
+  /** True for the turn's final answer revision. */
+  final: boolean;
+}
+
+/** What a streaming caller adds to the plain follow. */
+export interface TurnFollowHooks {
+  /** Report answer text as CoS records it (revisions are reduced to suffixes). */
+  onText?(update: TurnTextUpdate): void | Promise<void>;
+  /** Polled between reads and before each wait; true abandons the follow. */
+  cancelled?(): boolean;
 }
 
 /**
@@ -585,9 +626,11 @@ export class TurnManager {
     sessionId: string,
     inputId: string,
     deadline: number,
+    hooks?: TurnFollowHooks,
   ): Promise<{ seq: number; turnId?: string } | null> {
     let fromSeq = 0;
     for (;;) {
+      if (hooks?.cancelled?.() === true) throw new TurnDetached();
       if (this.now() >= deadline) throw new TurnTimeout('the message was never recorded as sent');
       const page = await this.internals.readSessionEvents(sessionId, {
         from: fromSeq, kinds: ANCHOR_KINDS, limit: 400
@@ -627,13 +670,19 @@ export class TurnManager {
     deadline: number,
     needAnswer: boolean,
     turnId?: string,
+    hooks?: TurnFollowHooks,
   ): Promise<string | null> {
     // Keyed mode scans the whole journal — the turn's rows may sit anywhere
     // (their seq order versus the anchor is exactly what broke). Positional
     // mode keeps the original from-cursor start.
     let cursor = turnId === undefined ? fromSeq : 0;
     let answer: string | null = null;
+    // What this follow has already reported per message id. CoS re-records one
+    // growing message under one id, so each revision contributes only its new
+    // suffix and a re-read can never duplicate text.
+    const reported = new Map<string, string>();
     for (;;) {
+      if (hooks?.cancelled?.() === true) throw new TurnDetached();
       if (this.now() >= deadline) throw new TurnTimeout('the turn did not finish in time');
       const page = await this.internals.readSessionEvents(sessionId, {
         from: cursor, kinds: TURN_KINDS, limit: 400
@@ -643,8 +692,20 @@ export class TurnManager {
           // Keyed mode attributes every row to its turn id; an untagged row
           // cannot be ours and is skipped. Positional mode uses all rows.
           if (turnId !== undefined && event.turnId !== turnId) continue;
-          if (event.kind === 'assistant_message' && event.final === true) {
-            answer = event.message?.text ?? '';
+          if (event.kind === 'assistant_message') {
+            const text = event.message?.text ?? '';
+            if (hooks?.onText !== undefined && text !== '') {
+              const messageId = event.messageId ?? '';
+              const shown = reported.get(messageId) ?? '';
+              // A revision that rewrites text already sent cannot take it
+              // back; it reports only what follows the rewrite.
+              const delta = text.startsWith(shown) ? text.slice(shown.length) : '';
+              reported.set(messageId, text);
+              if (delta !== '') {
+                await hooks.onText({ messageId, delta, final: event.final === true });
+              }
+            }
+            if (event.final === true) answer = text;
           } else if (event.kind === 'chat_error') {
             throw new TurnError(event.message?.text ?? 'the chat reported an error', {
               retryAt: event.retryAt,
@@ -665,12 +726,12 @@ export class TurnManager {
   }
 
   /** Follow the whole turn: anchor, then the answer for that turn's id. */
-  async followTurn(info: SessionInfo, inputId: string): Promise<string> {
+  async followTurn(info: SessionInfo, inputId: string, hooks?: TurnFollowHooks): Promise<string> {
     const sessionId = info.sessionId;
     if (sessionId === null) throw gatewayError('no_session');
     const deadline = this.now() + this.turnTimeoutMs;
     try {
-      const anchor = await this.findAnchor(sessionId, inputId, deadline);
+      const anchor = await this.findAnchor(sessionId, inputId, deadline, hooks);
       if (anchor === null) {
         const row = (await this.internals.listInputs()).find((candidate) => candidate.id === inputId);
         throw mapUndelivered(row?.error);
@@ -679,14 +740,20 @@ export class TurnManager {
       if (anchor.turnId !== undefined && anchor.turnId !== '') {
         this.store.recordNativeTurnId(inputId, anchor.turnId);
       }
-      const answer = (await this.waitTurn(sessionId, anchor.seq + 1, deadline, true, anchor.turnId)) ?? '';
+      const answer = (await this.waitTurn(
+        sessionId, anchor.seq + 1, deadline, true, anchor.turnId, hooks
+      )) ?? '';
       this.store.recordTurnOutcome(inputId, 'answered');
       return answer;
     } catch (error) {
       // A timeout is not a terminal outcome: the turn keeps running and the
       // slot stays, so the next request re-attaches. Everything else is final.
-      if (error instanceof TurnTimeout) {
-        this.store.recordTurnOutcome(inputId, 'timeout');
+      if (error instanceof TurnTimeout || error instanceof TurnDetached) {
+        // Same re-attachable state as a 504: the turn is still CoS's, only the
+        // follower is gone.
+        this.store.recordTurnOutcome(inputId, 'timeout', error instanceof TurnDetached
+          ? { error: 'the client stopped waiting' }
+          : {});
       } else {
         this.store.recordTurnOutcome(inputId, 'failed', {
           error: error instanceof Error ? error.message : 'the turn failed'
