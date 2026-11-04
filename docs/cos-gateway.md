@@ -324,8 +324,41 @@ rows, handle-scoped listing with cross-handle isolation on one state directory,
 and the `tools_unsupported` refusals. `/health`, `/v1/models` and
 `/v1/chat/completions` keep compatibility coverage alongside them.
 
+The H-044 offline acceptance matrix (`test/cos-gateway/http-matrix.test.ts`)
+drives the failure, restart and session-isolation behavior over real local HTTP
+against fake-CoS:
+
+- every published failure envelope: `429` with a usable `Retry-After` (and the
+  wait advice), both `chat_error` shapes, the post-admission `502`s
+  (`turn_ended_without_answer`, `not_delivered`), the `503`s
+  (`shutting_down` even for `stream: true`, `models_not_ready`/`models_unknown`)
+  and `504 turn_timeout` with the reattach advice;
+- duplicate handling: a retry of an in-flight turn re-attaches by turn id and
+  returns the recorded result without a second send, both after a `504` and
+  when the anchor landed after the turn end (the `cc5aa19` keyed follow), while
+  a concurrent duplicate is `429 session_busy`. The negative is pinned too:
+  because the idempotency key is the deterministic turn id over
+  `(conversation, seq, text, model, effort)`, an identical body after the turn
+  settled is the NEXT turn, not a cached answer;
+- restart: a turn in flight across a gateway restart resumes from the SQLite
+  store (the slot, outbox and turn rows are read on disk and must agree) and
+  answers without a second send; a turn that finished while the gateway was
+  down is settled before the next turn, and the old turn is kept;
+- two-handle isolation: a shared browser profile, userData, keyring, account or
+  port fails closed with `503 handle_registry_invalid` and no path detail; each
+  handle's readiness comes from its own browser evidence (unknown is not ready);
+  and on one shared state directory a handle can neither re-attach, list nor
+  adopt the other handle's conversation.
+
+**NOT proven offline: the live acceptance half, which remains operator-gated.**
+That half is a Playwright smoke of the real CoS UI inside Xvfb plus the
+operator-run `acceptance-cos.mjs` against a disposable account and a real
+browser turn. Until an operator runs it, read the failure/restart/isolation
+behavior above as source-and-test evidence only, never as a live deployment
+proof.
+
 Needs live verification: SCPM/LiteLLM forwarding (above), a real ChatGPT turn
-streaming through the embedded gateway, and disconnect latency against a real
-browser turn. The listing routes read only local state, so they need no live CoS
-turn; `/v1/handles` reports live browser evidence, which a real deployment
-supplies.
+streaming through the embedded gateway, disconnect latency against a real
+browser turn, and the operator-gated live half of H-044 described just above.
+The listing routes read only local state, so they need no live CoS turn;
+`/v1/handles` reports live browser evidence, which a real deployment supplies.
