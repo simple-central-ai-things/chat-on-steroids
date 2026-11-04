@@ -93,6 +93,119 @@ live check lands, treat `cos/*` through SCPM as JSON-only and call the gateway
 directly for streaming. If the proxy buffers, the stream still completes; it just
 arrives in one burst instead of incrementally.
 
+## Per-handle deployment (several accounts)
+
+One CoS process is one ChatGPT account: its browser profile, userData, keyring
+and its two ports belong to that account. A **handle** is the operator's alias
+for one such instance. Several accounts are several instances joined only by a
+handle registry — never by a shared browser profile, userData directory or
+keyring, because all three carry the account's cookies.
+
+With no handle configuration (`GATEWAY_HANDLES` and `GATEWAY_HANDLES_FILE` both
+unset) the gateway behaves exactly as the single-account descriptions above.
+
+### Registry
+
+`GATEWAY_HANDLES` holds the document inline; `GATEWAY_HANDLES_FILE` names a file
+with the same document (preferred at deploy time). Both accept an array or
+`{ "handles": [ … ] }`:
+
+```json
+{ "handles": [
+  { "handle": "work",
+    "instance": { "apiPort": 18801, "vncPort": 18811 },
+    "browserProfile": "/srv/cos/work/profile",
+    "userData": "/srv/cos/work/userdata",
+    "keyring": "/srv/cos/work/keyring",
+    "account": "work@example.invalid",
+    "models": [], "enabled": true, "order": 0 } ] }
+```
+
+`handle` is lowercase DNS-ish, 2–32 characters, no leading digit. `models` is a
+list of base model ids (empty means whatever that account's own catalog offers);
+`order` is the pool order; `enabled: false` disables a handle without removing
+it. `account` is the operator-facing label and never leaves the process.
+
+The document is **validated, never repaired**. A rejected registry answers every
+`/v1/*` route `503 handle_registry_invalid` and logs the reason once at startup
+(the log may name account-bearing paths; the HTTP body never does). Rejected:
+a malformed or repeated handle name, a port outside 1–65535, the same API and
+VNC port, and any two handles sharing a `browserProfile`, `userData`, `keyring`,
+`account` label, or any port (the port space is shared, so one instance's API
+port may not equal another's VNC port either). Shared-path comparison ignores
+case and duplicated/trailing slashes, so two directories differing only by case
+are refused rather than assumed distinct.
+
+`GATEWAY_HANDLE` names the handle the running instance serves. Setting
+`GATEWAY_HANDLES` without it is refused (fail closed) instead of guessing. An
+unknown or disabled name is refused the same way.
+
+### Identity
+
+A model is addressed as `<model>@cos-<handle>`; the marker is matched from the
+END so a model id containing `@` survives, and an empty handle is malformed. An
+instance serves exactly its own handle:
+
+| Request | Answer |
+| --- | --- |
+| no identity, or this instance's handle | served here |
+| unknown handle | `400 handle_unknown` |
+| disabled handle | `403 handle_disabled` |
+| another instance's handle | `400 handle_mismatch` (that instance is the only one that can reach that account) |
+
+`/v1/models` publishes every catalog model in deployment form
+(`<model>@cos-<handle>`), and `/v1/status` adds a `handle` block (alias and
+readiness only, no account detail) plus a `deployment` map of
+`<model>@cos-<handle>` entries. Authenticated responses carry `x-cos-handle` with
+the serving alias. A request is admitted only when its handle is **ready**:
+
+| Readiness | Meaning |
+| --- | --- |
+| `ready` | `signedIn`, `browserRunning` and `extensionFresh` are all positively true. |
+| `not_ready` | One of them is positively false. |
+| `unknown` | Any of them was never observed. Unknown is NOT ready. |
+| `disabled` | Operator-disabled. |
+
+A not-ready or unknown handle answers `503 handle_not_ready` and nothing is
+admitted, so a turn never silently goes nowhere.
+
+Conversation, session and retry keys are namespaced `cos:<handle>:<key>`, so a
+turn of one account can never be re-attached from another. Adopting a session
+recorded under a different handle is refused with `409 cross_handle_session`
+(`TurnManager.ownerOfSession` plus the key prefix, checked independently).
+
+### Pool failover (optional)
+
+A pool is several handles offering the same base model. Failover is narrow on
+purpose and is decided by `failover.ts` (`classifyFailure`, `planFailover`):
+
+| Failure | Class | Pool move |
+| --- | --- | --- |
+| `429` | `throttled` | honor `Retry-After` and wait; never hop accounts |
+| `503` availability (`shutting_down`, `queue_full`, `models_unknown`, `models_not_ready`, `gateway_unconfigured`, `handle_registry_invalid`, `handle_not_ready`, `handle_unavailable`) | `handle_unavailable` | next ready handle may serve it |
+| `504` | `terminal` | the turn is still running there; re-attach, do not duplicate |
+| anything else | `terminal` | no move |
+
+A handle already attempted is never tried twice for one request, so a pool
+cannot loop; with no ready handle left the plan is `stop` with the reason.
+
+### Proven offline vs needs a live second account
+
+Proven offline, with synthetic fixtures only: registry validation and every
+isolation refusal, identity parsing/resolution (including the malformed,
+unknown, disabled and foreign cases), readiness gating (unknown is not ready),
+deployment-map/status projections with no account detail, handle-scoped keys,
+cross-handle session denial, and every failover classification and pool move.
+Single-account behavior is pinned by a test that runs a gateway with no handle
+configuration.
+
+**NOT proven: a live second account.** No second CoS instance, VNC session or
+browser was started, and no account material exists in the repository. Serving
+two real accounts at once needs an operator-gated live run (a separate consent:
+a second account, its own browser profile/keyring, and two spare ports), and
+that is the only way to confirm two real instances side by side. Until then,
+read the multi-handle path as source-and-test evidence only.
+
 ## Environment
 
 | Variable | Default | Meaning |
@@ -102,6 +215,9 @@ arrives in one burst instead of incrementally.
 | `TURN_TIMEOUT_SECONDS` | `600` | Whole-turn wait before a timeout error. |
 | `GATEWAY_INCLUDE_SYSTEM` | on | `0`/`false` drops system messages from the folded turn. |
 | `STREAM_HEARTBEAT_SECONDS` | `15` | SSE comment interval; `0` disables. |
+| `GATEWAY_HANDLES` | unset | Inline handle registry JSON (array or `{handles:[…]}`). |
+| `GATEWAY_HANDLES_FILE` | unset | Path to the same document (preferred at deploy time). |
+| `GATEWAY_HANDLE` | unset | The handle THIS instance serves; required with a registry. |
 
 ## Proven offline vs needs live verification
 
