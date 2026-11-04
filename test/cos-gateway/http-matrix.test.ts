@@ -14,7 +14,11 @@
  *              keyring, account or port; each handle's readiness comes from
  *              its own fake browser evidence (unknown stays unknown); and on
  *              one shared state directory a handle can neither re-attach, list
- *              nor adopt the other handle's conversation.
+ *              nor adopt the other handle's conversation,
+ *  - stop      an in-flight turn is interrupted (stream and whole-answer), the
+ *              terminal `stopped` row is recorded once, an identical resend is
+ *              a new turn, a terminal or unknown turn is safe, and a stop is
+ *              handle-scoped and bearer-gated like every other route.
  *
  * Duplicate-request note: this gateway has no client-supplied request-id cache.
  * Its idempotency key is the deterministic turn id derived from
@@ -131,6 +135,17 @@ function post(
 }
 
 const user = (text: string): Array<{ role: string; content: string }> => [{ role: 'user', content: text }];
+
+/** POST /v1/conversations/{key}/turns/{turnId}/stop (H-046). */
+function stopTurn(
+  gateway: OpenAiServer,
+  conversation: string,
+  turnId: string,
+  headers: Record<string, string> = authed,
+): Promise<Response> {
+  const route = `/v1/conversations/${encodeURIComponent(conversation)}/turns/${encodeURIComponent(turnId)}/stop`;
+  return fetch(`${base(gateway)}${route}`, { method: 'POST', headers });
+}
 
 function configFor(options: { handles?: unknown; handle?: string } = {}): GatewayConfig {
   const env: NodeJS.ProcessEnv = { GATEWAY_API_KEY: key };
@@ -274,6 +289,30 @@ async function turnsOf(gateway: OpenAiServer, conversation: string): Promise<Tur
 async function answerText(reply: Response): Promise<string> {
   const body = (await reply.json()) as { choices: Array<{ message: { content: string } }> };
   return body.choices[0]!.message.content;
+}
+
+interface StreamFrame {
+  done?: boolean;
+  error?: { code?: string; message?: string };
+}
+
+/** Decode the `data:` frames of an SSE answer (comments/heartbeats are skipped). */
+function sseFrames(text: string): StreamFrame[] {
+  const frames: StreamFrame[] = [];
+  for (const line of text.split('\n')) {
+    if (!line.startsWith('data: ')) continue;
+    const data = line.slice(6);
+    if (data === '[DONE]') {
+      frames.push({ done: true });
+      continue;
+    }
+    try {
+      frames.push(JSON.parse(data) as StreamFrame);
+    } catch {
+      // A comment or a partial line is not a frame.
+    }
+  }
+  return frames;
 }
 
 // -------------------------------------------------------------- failure matrix
@@ -811,4 +850,198 @@ test('H-044/handles: on one shared state directory a handle cannot re-attach, li
   assert.equal(adoptedBody.error.code, 'cross_handle_session');
   assert.match(adoptedBody.error.message, /another handle/);
   assert.equal(homeFake.sent.length, 1, 'nothing was sent into the other account\'s conversation');
+});
+
+// ---------------------------------------------------------------------- stop
+
+test('H-046/stop: a mid-flight stream is stopped, recorded once, and an identical resend is a new turn', async () => {
+  const dir = stateDir('cos-http-stop-stream');
+  const fake = new FakeCos();
+  fake.catalog = readyCatalog;
+  const gateway = await startGateway(fake, configFor(), { stateDir: dir });
+  const conversation = 'sess-stop-stream';
+  const messages = user('Long answer please');
+
+  const streaming = post(gateway, { messages, stream: true }, { 'x-cos-session': conversation });
+  await waitFor(() => fake.sent.length === 1);
+  const stoppedId = fake.sent[0]!.id;
+  deliverAnchor(fake, stoppedId);
+  // Let the follower reach its wait loop, so the stop interrupts a running
+  // follow instead of racing the anchor read.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const reply = await stopTurn(gateway, conversation, stoppedId);
+  assert.equal(reply.status, 200);
+  const body = (await reply.json()) as TurnPage['data'][number] & { changed: boolean };
+  assert.equal(body.object, 'turn');
+  assert.equal(body.id, stoppedId);
+  assert.equal(body.state, 'stopped');
+  assert.equal(body.changed, true);
+
+  const stream = await streaming;
+  assert.equal(stream.status, 200);
+  const frames = sseFrames(await stream.text());
+  assert.equal(frames.some((frame) => frame.done === true), false,
+    'a stopped turn never ends the stream with [DONE]');
+  assert.equal(frames.at(-1)?.error?.code, 'turn_stopped', 'the stop is a failed stream, not a complete answer');
+  assert.equal(contractRow('turn_stopped', 409).advice, 'none');
+  assert.equal(contractRow('turn_stopped', 409).may_failover, false);
+
+  // Terminal, not re-attachable: listing already shows the recorded state.
+  const page = await conversations(gateway);
+  assert.equal(page.data[0]!.in_flight, null, 'the stop clears the in-flight slot');
+  assert.equal((await turnsOf(gateway, conversation)).data[0]!.state, 'stopped');
+
+  // The sequence was consumed, so the same body is the NEXT turn.
+  const again = post(gateway, { messages }, { 'x-cos-session': conversation });
+  await waitFor(() => fake.sent.length === 2);
+  const nextId = fake.sent[1]!.id;
+  assert.notEqual(nextId, stoppedId, 'a stopped turn is never resumed or replayed');
+  deliverTurn(fake, nextId, 'the later answer');
+  const later = await again;
+  assert.equal(later.status, 200);
+  assert.equal(await answerText(later), 'the later answer');
+
+  await stopGateway(gateway);
+  const stored = GatewayStateStore.open({ dir });
+  try {
+    assert.equal(stored.turn(stoppedId)?.state, 'stopped');
+    assert.equal(stored.outboxRow(stoppedId)?.state, 'cancelled', 'the stopped outbox row is cancelled');
+    assert.equal(stored.turn(nextId)?.state, 'settled');
+    assert.equal(stored.inFlight(conversation), null);
+  } finally {
+    stored.close();
+  }
+});
+
+test('H-046/stop: a whole-answer request answers 409 turn_stopped and a late answer never revives it', async () => {
+  const dir = stateDir('cos-http-stop-whole');
+  const fake = new FakeCos();
+  fake.catalog = readyCatalog;
+  const gateway = await startGateway(fake, configFor(), { stateDir: dir });
+  const conversation = 'sess-stop-whole';
+
+  const pending = post(gateway, { messages: user('Answer eventually') }, { 'x-cos-session': conversation });
+  await waitFor(() => fake.sent.length === 1);
+  const inputId = fake.sent[0]!.id;
+  deliverAnchor(fake, inputId);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const reply = await stopTurn(gateway, conversation, inputId);
+  assert.equal(reply.status, 200);
+  assert.equal(((await reply.json()) as { changed: boolean }).changed, true);
+
+  const { response } = await expectFailure(pending, 'turn_stopped', 409);
+  assert.equal(response.headers.get('retry-after'), null, 'a stop is not a throttle');
+
+  // CoS may still record the answer of the turn it never cancelled. Nothing
+  // follows it, and the recorded terminal state is not rewritten.
+  deliverTurn(fake, inputId, 'too late');
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal((await turnsOf(gateway, conversation)).data[0]!.state, 'stopped');
+  assert.equal((await conversations(gateway)).data[0]!.in_flight, null);
+
+  // A stopped turn is terminal: a repeated stop is an idempotent success.
+  const repeat = await stopTurn(gateway, conversation, inputId);
+  assert.equal(repeat.status, 200);
+  const repeatBody = (await repeat.json()) as { state: string; changed: boolean };
+  assert.equal(repeatBody.changed, false);
+  assert.equal(repeatBody.state, 'stopped');
+
+  await stopGateway(gateway);
+  const stored = GatewayStateStore.open({ dir });
+  try {
+    assert.equal(stored.turn(inputId)?.state, 'stopped');
+    assert.equal(stored.outboxRow(inputId)?.state, 'cancelled');
+    assert.equal(stored.inFlight(conversation), null);
+  } finally {
+    stored.close();
+  }
+});
+
+test('H-046/stop: terminal, unknown, malformed and unauthenticated stops keep the published contract', async () => {
+  const fake = new FakeCos();
+  fake.catalog = readyCatalog;
+  const gateway = await startGateway(fake, configFor());
+  const conversation = 'sess-stop-errors';
+
+  const reply = post(gateway, { messages: user('Finish normally') }, { 'x-cos-session': conversation });
+  await waitFor(() => fake.sent.length === 1);
+  const inputId = fake.sent[0]!.id;
+  deliverTurn(fake, inputId, 'normal answer');
+  assert.equal((await reply).status, 200);
+
+  // A settled turn is terminal: success with the recorded state, no change.
+  const terminal = await stopTurn(gateway, conversation, inputId);
+  assert.equal(terminal.status, 200);
+  const terminalBody = (await terminal.json()) as { state: string; changed: boolean };
+  assert.equal(terminalBody.changed, false);
+  assert.equal(terminalBody.state, 'settled');
+
+  // Unknown turn on a known conversation, and an unknown conversation.
+  await expectFailure(stopTurn(gateway, conversation, 'no-such-turn'), 'not_found', 404);
+  await expectFailure(stopTurn(gateway, 'sess-never-seen', inputId), 'not_found', 404);
+
+  // A malformed percent escape in either segment is not a conversation this
+  // gateway published; it never reaches the manager.
+  const malformedKey = await fetch(
+    `${base(gateway)}/v1/conversations/%E0%A4%A/turns/${encodeURIComponent(inputId)}/stop`,
+    { method: 'POST', headers: authed },
+  );
+  await expectFailure(Promise.resolve(malformedKey), 'not_found', 404);
+  const malformedTurn = await fetch(
+    `${base(gateway)}/v1/conversations/${encodeURIComponent(conversation)}/turns/%E0%A4%A/stop`,
+    { method: 'POST', headers: authed },
+  );
+  await expectFailure(Promise.resolve(malformedTurn), 'not_found', 404);
+
+  // The same bearer gate as every other /v1/* route.
+  const unauthenticated = await fetch(
+    `${base(gateway)}/v1/conversations/${encodeURIComponent(conversation)}/turns/${encodeURIComponent(inputId)}/stop`,
+    { method: 'POST' },
+  );
+  assert.equal(unauthenticated.status, 401);
+  assert.equal(((await unauthenticated.json()) as ErrorEnvelope).error.code, 'unauthorized');
+  assert.equal((await turnsOf(gateway, conversation)).data[0]!.state, 'settled', 'no denial mutated the turn');
+});
+
+test('H-046/stop: a stop scoped to another handle is denied and leaves that turn untouched', async () => {
+  const dir = stateDir('cos-http-stop-shared');
+  const handles = handlesFixture();
+  const conversation = 'sess-stop-shared';
+  const workKey = 'cos:work:sess-stop-shared';
+  const options: GatewayOptions = { stateDir: dir, turnTimeoutMs: 5000, pollMs: 20, refTimers: false };
+
+  const workFake = new FakeCos();
+  workFake.catalog = readyCatalog;
+  signIn(workFake);
+  const work = await startGateway(workFake, configFor({ handles, handle: 'work' }), options);
+  const pending = post(work, { messages: user('Shared stop') }, { 'x-cos-session': conversation });
+  await waitFor(() => workFake.sent.length === 1);
+  const workInputId = workFake.sent[0]!.id;
+  deliverAnchor(workFake, workInputId);
+  const abandoned = pending.catch(() => null);
+  await stopGateway(work);
+  await abandoned;
+
+  const homeFake = new FakeCos();
+  homeFake.catalog = readyCatalog;
+  signIn(homeFake);
+  const home = await startGateway(homeFake, configFor({ handles, handle: 'home' }), options);
+
+  // A registered handle's key is a deliberate cross-account stop.
+  await expectFailure(stopTurn(home, workKey, workInputId), 'cross_handle_session', 409);
+  // An unregistered prefix and home's own unknown conversation are indistinguishable
+  // from a conversation that never existed.
+  await expectFailure(stopTurn(home, 'cos:ghost:sess-stop-shared', workInputId), 'not_found', 404);
+  await expectFailure(stopTurn(home, 'cos:home:sess-stop-shared', workInputId), 'not_found', 404);
+  await stopGateway(home);
+
+  const stored = GatewayStateStore.open({ dir });
+  try {
+    assert.equal(stored.turn(workInputId)?.state, 'in_flight', 'the denied stop never touched the turn');
+    assert.equal(stored.inFlight(workKey)?.turnId, workInputId);
+  } finally {
+    stored.close();
+  }
 });

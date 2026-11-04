@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   SessionBusy,
   TurnError,
   TurnManager,
+  TurnStopped,
   TurnTimeout,
   turnInputId,
   type SessionInfo,
@@ -14,10 +15,24 @@ import {
 } from '../../src/main/openai-gateway/turns.js';
 import { GatewayError } from '../../src/main/openai-gateway/errors.js';
 import { normalizeMessages } from '../../src/main/openai-gateway/fold.js';
+import { GatewayStateStore } from '../../src/main/openai-gateway/state/store.js';
 import { SHADOW_STATE_FILE } from '../../src/main/openai-gateway/state/legacy-json.js';
-import { FakeCos, deliverTurn } from './fake-cos.js';
+import { FakeCos, deliverAnchor, deliverTurn } from './fake-cos.js';
 
 const stateDir = (): string => mkdtempSync(path.join(tmpdir(), 'cos-gateway-test-'));
+
+/**
+ * Scratch state for the stop tests: this host's `/tmp` is a RAM tmpfs and must
+ * not hold gateway state, so these directories live under the operator's cache
+ * (or COS_GATEWAY_TEST_TMP in CI). Nothing here deletes; the no-rm rule keeps
+ * the small fixture directories in place.
+ */
+const STOP_TEST_TMP_ROOT =
+  (process.env.COS_GATEWAY_TEST_TMP ?? '').trim() || path.join(homedir(), '.cache', 'opencode', 'tmp');
+const durableStateDir = (): string => {
+  mkdirSync(STOP_TEST_TMP_ROOT, { recursive: true });
+  return mkdtempSync(path.join(STOP_TEST_TMP_ROOT, 'cos-gateway-stop-'));
+};
 
 const managerFor = (fake: FakeCos, extra: Record<string, unknown> = {}): TurnManager =>
   new TurnManager(fake, stateDir(), { pollMs: 1, queueWaitMs: 50, turnTimeoutMs: 2000, refTimers: true, ...extra });
@@ -529,5 +544,96 @@ test('a chat_error recorded for the same turn id is surfaced by the keyed follow
     );
   } finally {
     release();
+  }
+});
+
+test('stopTurn aborts the running follow, clears the slot and records the terminal state once', async () => {
+  const fake = new FakeCos();
+  const dir = durableStateDir();
+  const manager = new TurnManager(fake, dir, { pollMs: 1, turnTimeoutMs: 5000, refTimers: true });
+  const { info, release } = await manager.acquire('k1');
+  let inputId = '';
+  try {
+    const plan = planFor(manager, 'k1', 'Hello');
+    const sent = await manager.sendTurn(info, plan, { model: null, reasoningEffort: null });
+    inputId = sent.inputId;
+    deliverAnchor(fake, sent.inputId);
+    const following = manager.followTurn(info, sent.inputId);
+    // Let the follower reach its wait loop before the operator stops it.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const stopped = manager.stopTurn('k1', sent.inputId);
+    assert.equal(stopped.changed, true);
+    assert.equal(stopped.turn.state, 'stopped');
+    assert.equal(info.turnInput, null, 'the stop releases the slot at once');
+    assert.equal(info.turnSeq, plan.seq + 1, 'the stopped turn consumes its sequence');
+    assert.equal(manager.isStopped(sent.inputId), true);
+
+    await assert.rejects(following, (error: unknown) => error instanceof TurnStopped);
+
+    // Idempotent: a second stop reports the recorded state and changes nothing.
+    const again = manager.stopTurn('k1', sent.inputId);
+    assert.equal(again.changed, false);
+    assert.equal(again.turn.state, 'stopped');
+    assert.equal(info.turnSeq, plan.seq + 1, 'a repeated stop never consumes another sequence');
+
+    // A turn id of another conversation is a 404, exactly like listing one.
+    assert.throws(
+      () => manager.stopTurn('k2', sent.inputId),
+      (error: unknown) => error instanceof GatewayError && error.code === 'not_found'
+    );
+
+    // The sequence was consumed, so the identical body is the NEXT turn.
+    const next = planFor(manager, 'k1', 'Hello');
+    assert.equal(next.replaying, false);
+    assert.equal(next.seq, plan.seq + 1);
+    assert.notEqual(next.inputId, sent.inputId);
+  } finally {
+    release();
+    manager.dispose();
+  }
+
+  const stored = GatewayStateStore.open({ dir });
+  try {
+    assert.equal(stored.turn(inputId)?.state, 'stopped');
+    assert.equal(stored.outboxRow(inputId)?.state, 'cancelled');
+    assert.equal(stored.inFlight('k1'), null);
+  } finally {
+    stored.close();
+  }
+});
+
+test('settleLeftover resolves instead of hanging when the leftover turn is stopped', async () => {
+  const fake = new FakeCos();
+  const dir = durableStateDir();
+  const first = new TurnManager(fake, dir, { pollMs: 1, turnTimeoutMs: 5000, refTimers: true });
+  const acquired = await first.acquire('k1');
+  const sent = await sendPlain(first, 'k1', acquired.info, 'Hello');
+  deliverAnchor(fake, sent.inputId);
+  acquired.release();
+  first.dispose();
+
+  const second = new TurnManager(fake, dir, { pollMs: 1, turnTimeoutMs: 5000, refTimers: true });
+  const { info, release } = await second.acquire('k1');
+  try {
+    const settling = second.settleLeftover(info);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const stopped = second.stopTurn('k1', sent.inputId);
+    assert.equal(stopped.changed, true);
+    // `stopTurn` already recorded `stopped`; settling must not hang or rewrite it.
+    await settling;
+    assert.equal(info.turnInput, null);
+  } finally {
+    release();
+    second.dispose();
+  }
+
+  const stored = GatewayStateStore.open({ dir });
+  try {
+    assert.equal(stored.turn(sent.inputId)?.state, 'stopped');
+    assert.equal(stored.outboxRow(sent.inputId)?.state, 'cancelled');
+    assert.equal(stored.inFlight('k1'), null);
+  } finally {
+    stored.close();
   }
 });
