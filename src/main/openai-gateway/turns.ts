@@ -219,6 +219,20 @@ export class TurnDetached extends Error {
   }
 }
 
+/**
+ * The operator stopped this turn (POST .../turns/{turnId}/stop). Distinct from
+ * both of the others: TurnDetached means the caller went away and the turn is
+ * still CoS's, while TurnStopped means the turn is over for good. `stopTurn`
+ * already recorded the terminal `stopped` state and cleared the slot, so a
+ * follower that sees this must record nothing else and must never resume it.
+ */
+export class TurnStopped extends Error {
+  constructor(message = 'the turn was stopped by the operator') {
+    super(message);
+    this.name = 'TurnStopped';
+  }
+}
+
 /** One answer increment: only text the caller has not been told yet. */
 export interface TurnTextUpdate {
   /** ChatGPT's message id, '' for a legacy row that carried none. */
@@ -235,6 +249,11 @@ export interface TurnFollowHooks {
   onText?(update: TurnTextUpdate): void | Promise<void>;
   /** Polled between reads and before each wait; true abandons the follow. */
   cancelled?(): boolean;
+  /**
+   * Polled like `cancelled`, but for the operator's stop: true aborts the
+   * follow as a `TurnStopped` (the terminal state is already recorded).
+   */
+  stopped?(): boolean;
 }
 
 /**
@@ -296,6 +315,14 @@ export class TurnManager {
   private readonly states = new Map<string, SessionInfo>();
   private readonly locks = new Map<string, Promise<void>>();
   private readonly wakeups = new Map<string, Set<() => void>>();
+  /**
+   * Turn ids the operator stopped through `stopTurn`. Every follow loop checks
+   * it, so a follower (including a `settle` waiting on a leftover turn) aborts
+   * at its next tick. The id stays here for the process lifetime: a stopped turn
+   * is terminal in the store, so a later request derives a fresh id and can
+   * never resume it, but an in-flight follower may still be noticing.
+   */
+  private readonly stoppedTurns = new Set<string>();
   private loaded = false;
   private unsubscribe: (() => void) | null = null;
 
@@ -491,6 +518,14 @@ export class TurnManager {
     try {
       await this.settle(info);
     } catch (error) {
+      if (error instanceof TurnStopped) {
+        // stopTurn already recorded the terminal `stopped` outcome, cleared the
+        // slot and consumed the sequence; recording again would overwrite it.
+        info.turnInput = null;
+        info.turnStartedAt = null;
+        this.persistFor(info);
+        return;
+      }
       if (error instanceof TurnTimeout) throw new SessionBusy(Math.ceil(this.queueWaitMs / 1000));
       throw error;
     }
@@ -503,9 +538,11 @@ export class TurnManager {
   /** Wait out an in-flight turn left behind by a restart or a timeout. */
   private async settle(info: SessionInfo): Promise<void> {
     const deadline = this.now() + this.turnTimeoutMs;
-    const anchor = await this.findAnchor(info.sessionId!, info.turnInput!, deadline);
+    const inputId = info.turnInput!;
+    const hooks: TurnFollowHooks = { stopped: () => this.isStopped(inputId) };
+    const anchor = await this.findAnchor(info.sessionId!, inputId, deadline, hooks);
     if (anchor === null) return; // the row never delivered; nothing is running
-    await this.waitTurn(info.sessionId!, anchor.seq + 1, deadline, false, anchor.turnId);
+    await this.waitTurn(info.sessionId!, anchor.seq + 1, deadline, false, anchor.turnId, hooks);
   }
 
   /**
@@ -562,6 +599,52 @@ export class TurnManager {
     info.turnSeq += 1;
     if (settled !== null) this.store.recordTurnOutcome(settled, 'settled');
     this.persistFor(info);
+  }
+
+  // -------------------------------------------------------------------- stop
+
+  /** Whether this turn was stopped through `stopTurn` (it never resumes). */
+  isStopped(turnId: string): boolean {
+    return this.stoppedTurns.has(turnId);
+  }
+
+  /**
+   * Stop an in-flight turn: POST /v1/conversations/{key}/turns/{turnId}/stop.
+   *
+   * Deliberately synchronous. The request that is following the turn holds the
+   * per-conversation lock for its whole lifetime, so a stop must not acquire
+   * it; every mutation below runs in one turn of the event loop, which makes
+   * the transition atomic: signal the follower, clear the slot and consume its
+   * sequence (an identical later body is a fresh turn, never a replay), record
+   * the terminal `stopped` state (mirrored to `cancelled` in the outbox),
+   * persist, then wake the follower's sleep so it aborts at once.
+   *
+   * A turn that already reached a terminal state is an idempotent no-op that
+   * returns the recorded row. A turn id that is not this conversation's turn is
+   * a 404, exactly like listing an unknown turn.
+   */
+  stopTurn(key: string, turnId: string): { turn: StoredTurn; changed: boolean } {
+    this.ensureLoaded();
+    const turn = this.store.turn(turnId);
+    if (turn === null || turn.conversationKey !== key) {
+      throw gatewayError('not_found', 'no such turn');
+    }
+    if (turn.state !== 'in_flight') return { turn, changed: false };
+
+    this.stoppedTurns.add(turnId);
+    const info = this.states.get(key) ?? null;
+    let sessionId: string | null = null;
+    if (info !== null && info.turnInput === turnId) {
+      sessionId = info.sessionId;
+      info.turnInput = null;
+      info.turnStartedAt = null;
+      // finishTurn's rule: the in-flight sequence is consumed once.
+      info.turnSeq = Math.max(info.turnSeq, turn.seq) + 1;
+    }
+    this.store.recordTurnOutcome(turnId, 'stopped');
+    if (info !== null) this.persistConversation(key);
+    if (sessionId !== null) this.wake([sessionId]);
+    return { turn: this.store.turn(turnId) ?? turn, changed: true };
   }
 
   // -------------------------------------------------------------------- send
@@ -672,6 +755,7 @@ export class TurnManager {
   ): Promise<{ seq: number; turnId?: string } | null> {
     let fromSeq = 0;
     for (;;) {
+      if (hooks?.stopped?.() === true) throw new TurnStopped();
       if (hooks?.cancelled?.() === true) throw new TurnDetached();
       if (this.now() >= deadline) throw new TurnTimeout('the message was never recorded as sent');
       const page = await this.internals.readSessionEvents(sessionId, {
@@ -724,6 +808,7 @@ export class TurnManager {
     // suffix and a re-read can never duplicate text.
     const reported = new Map<string, string>();
     for (;;) {
+      if (hooks?.stopped?.() === true) throw new TurnStopped();
       if (hooks?.cancelled?.() === true) throw new TurnDetached();
       if (this.now() >= deadline) throw new TurnTimeout('the turn did not finish in time');
       const page = await this.internals.readSessionEvents(sessionId, {
@@ -772,8 +857,14 @@ export class TurnManager {
     const sessionId = info.sessionId;
     if (sessionId === null) throw gatewayError('no_session');
     const deadline = this.now() + this.turnTimeoutMs;
+    // The manager's stop signal is authoritative; a caller's own stop hook can
+    // only add to it. Every loop below therefore sees the operator stop too.
+    const stopAware: TurnFollowHooks = {
+      ...hooks,
+      stopped: () => this.isStopped(inputId) || hooks?.stopped?.() === true,
+    };
     try {
-      const anchor = await this.findAnchor(sessionId, inputId, deadline, hooks);
+      const anchor = await this.findAnchor(sessionId, inputId, deadline, stopAware);
       if (anchor === null) {
         const row = (await this.internals.listInputs()).find((candidate) => candidate.id === inputId);
         throw mapUndelivered(row?.error);
@@ -782,12 +873,19 @@ export class TurnManager {
       if (anchor.turnId !== undefined && anchor.turnId !== '') {
         this.store.recordNativeTurnId(inputId, anchor.turnId);
       }
+      if (this.isStopped(inputId)) throw new TurnStopped();
       const answer = (await this.waitTurn(
-        sessionId, anchor.seq + 1, deadline, true, anchor.turnId, hooks
+        sessionId, anchor.seq + 1, deadline, true, anchor.turnId, stopAware
       )) ?? '';
+      // A stop can land between the last read and this write. The stop already
+      // recorded the terminal outcome, so an answer must never overwrite it.
+      if (this.isStopped(inputId)) throw new TurnStopped();
       this.store.recordTurnOutcome(inputId, 'answered');
       return answer;
     } catch (error) {
+      // stopTurn already recorded `stopped` and cleared the slot; recording
+      // anything here would rewrite that terminal state.
+      if (error instanceof TurnStopped) throw error;
       // A timeout is not a terminal outcome: the turn keeps running and the
       // slot stays, so the next request re-attaches. Everything else is final.
       if (error instanceof TurnTimeout || error instanceof TurnDetached) {

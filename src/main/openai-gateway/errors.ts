@@ -66,6 +66,7 @@ export const GATEWAY_ERRORS = {
   cross_handle_session: { status: 409, message: 'that session belongs to another handle' },
   id_conflict: { status: 409, message: 'this id belongs to a different message' },
   cancelled: { status: 409, message: 'cancelled' },
+  turn_stopped: { status: 409, message: 'the turn was stopped before it finished' },
   busy: { status: 429, message: 'another message for this chat is still awaiting delivery' },
   would_interrupt: { status: 429, message: 'the chat is answering right now; retry once the turn ends' },
   session_busy: { status: 429, message: 'one turn is still running for this conversation' },

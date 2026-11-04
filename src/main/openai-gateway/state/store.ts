@@ -486,7 +486,11 @@ export class GatewayStateStore {
       this.stmt(
         `UPDATE turns SET state = ?, finished_at = ?, last_error = COALESCE(?, last_error) WHERE turn_id = ?`
       ).run(outcome, at, error, turnId);
-      const outboxState: OutboxState = outcome === 'timeout' ? 'timeout' : outcome === 'failed' ? 'failed' : 'answered';
+      // A stopped turn is the outbox's `cancelled`: called back, never sent.
+      const outboxState: OutboxState = outcome === 'timeout' ? 'timeout'
+        : outcome === 'failed' ? 'failed'
+        : outcome === 'stopped' ? 'cancelled'
+        : 'answered';
       this.stmt(
         `UPDATE outbox SET state = ?, last_error = COALESCE(?, last_error), updated_at = ? WHERE input_id = ?`
       ).run(outboxState, error, at, turnId);
@@ -879,7 +883,8 @@ function turnFromRow(row: RawTurnRow): StoredTurn {
     seq: integer(row.seq, 0),
     sessionId: text(row.session_id),
     nativeTurnId: text(row.native_turn_id),
-    state: state === 'answered' || state === 'failed' || state === 'timeout' || state === 'settled'
+    state: state === 'answered' || state === 'failed' || state === 'timeout' || state === 'settled' ||
+      state === 'stopped'
       ? state
       : 'in_flight',
     startedAt: integer(row.started_at, 0),
@@ -896,7 +901,7 @@ function outboxFromRow(row: RawOutboxRow): StoredOutboxRow {
     turnId: text(row.turn_id) ?? '',
     conversationKey: text(row.conversation_key) ?? '',
     state: state === 'queued' || state === 'sending' || state === 'sent' ||
-      state === 'timeout' || state === 'failed' || state === 'answered'
+      state === 'timeout' || state === 'failed' || state === 'answered' || state === 'cancelled'
       ? state
       : 'queued',
     attempts: integer(row.attempts, 0),

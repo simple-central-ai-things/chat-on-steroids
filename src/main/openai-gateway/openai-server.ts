@@ -47,8 +47,11 @@ import {
 } from './errors.js';
 import { ERROR_CONTRACT, ERROR_CONTRACT_VERSION } from './contract.js';
 import {
+  conversationInScope,
   listConversations,
-  listTurns
+  listTurns,
+  turnView,
+  type TurnView
 } from './listing.js';
 import {
   completionId,
@@ -56,6 +59,7 @@ import {
   TurnDetached,
   TurnError,
   TurnManager,
+  TurnStopped,
   TurnTimeout,
   type CosInternals,
   type SessionInfo,
@@ -350,6 +354,19 @@ async function handleRequest(
     send(res, 200, listTurns(manager, servingHandle(config), conversationKey, query));
     return;
   }
+  const stopRoute = /^\/v1\/conversations\/([^/]+)\/turns\/([^/]+)\/stop$/.exec(url);
+  if (req.method === 'POST' && stopRoute !== null) {
+    let conversationKey: string;
+    let turnId: string;
+    try {
+      conversationKey = decodeURIComponent(stopRoute[1]!);
+      turnId = decodeURIComponent(stopRoute[2]!);
+    } catch {
+      throw gatewayError('not_found', 'no such conversation');
+    }
+    send(res, 200, handleStopTurn(manager, config, conversationKey, turnId));
+    return;
+  }
   if (req.method === 'POST' && url === '/v1/chat/completions') {
     await handleCompletions(req, res, internals, config, manager);
     return;
@@ -454,6 +471,45 @@ async function handleModels(
 /** The handle this instance serves, or null in single-account mode. */
 function servingHandle(config: GatewayConfig): string | null {
   return config.serving?.local.handle ?? null;
+}
+
+/**
+ * POST /v1/conversations/{key}/turns/{turnId}/stop (H-046).
+ *
+ * The store's one mutating route besides a completion: it interrupts an
+ * in-flight turn and records the terminal `stopped` state. It deliberately
+ * takes no conversation lock — the request following that turn holds it for
+ * its whole lifetime — so the manager's transition is synchronous and atomic.
+ *
+ * Scope matches the listing: a conversation from outside this instance's scope
+ * is never revealed. A key whose prefix names another handle this deployment
+ * defines is a deliberate cross-account attempt (`409 cross_handle_session`);
+ * any other foreign or unknown key is indistinguishable from a missing one
+ * (`404`). SEALED has no representation in this fork: it is enforced by the
+ * SCPM router/provider in front of the gateway, so this route inherits the same
+ * bearer, registry and scope gates as every other `/v1/*` request instead of
+ * inventing a local flag.
+ */
+function handleStopTurn(
+  manager: TurnManager,
+  config: GatewayConfig,
+  conversationKey: string,
+  turnId: string,
+): TurnView & { changed: boolean } {
+  const localHandle = servingHandle(config);
+  if (!conversationInScope(conversationKey, localHandle)) {
+    const owner = handleOfConversationKey(conversationKey);
+    const foreignRegistered = owner !== null &&
+      config.serving !== null && config.serving.registry.get(owner) !== null;
+    throw foreignRegistered
+      ? gatewayError('cross_handle_session')
+      : gatewayError('not_found', 'no such conversation');
+  }
+  if (!manager.hasConversation(conversationKey)) {
+    throw gatewayError('not_found', 'no such conversation');
+  }
+  const { turn, changed } = manager.stopTurn(conversationKey, turnId);
+  return { ...turnView(turn), changed };
 }
 
 const NO_HANDLE_EVIDENCE = { signedIn: null, browserRunning: null, extensionFresh: null } as const;
@@ -837,6 +893,11 @@ function settleFollowFailure(
   error: unknown,
   turnTimeoutSeconds: number,
 ): { kind: 'detached' } | { kind: 'failed'; error: GatewayErrorData } {
+  if (error instanceof TurnStopped) {
+    // `stopTurn` already recorded `stopped` and cleared the slot; finishing it
+    // again would overwrite that terminal state with `settled`.
+    return { kind: 'failed', error: gatewayError('turn_stopped') };
+  }
   if (error instanceof TurnDetached) return { kind: 'detached' };
   if (error instanceof TurnTimeout) {
     // The turn keeps running; the persisted slot lets the next request re-attach.

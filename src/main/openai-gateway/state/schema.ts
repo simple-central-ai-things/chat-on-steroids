@@ -56,8 +56,12 @@ export interface ConversationState {
   turnSeq: number;
 }
 
-/** A logical turn's lifecycle. `in_flight` is the only non-terminal state. */
-export type TurnState = 'in_flight' | 'answered' | 'failed' | 'timeout' | 'settled';
+/**
+ * A logical turn's lifecycle. `in_flight` is the only non-terminal state;
+ * `stopped` is the operator's terminal stop (POST .../turns/{id}/stop), kept
+ * distinct from a chat-side failure so it is never reported as an answer.
+ */
+export type TurnState = 'in_flight' | 'answered' | 'failed' | 'timeout' | 'settled' | 'stopped';
 
 /**
  * One conversation as the read-only listing reads it: the persisted row plus
@@ -97,8 +101,12 @@ export interface StoredTurn {
   lastError: string | null;
 }
 
-/** The delivery state of the CoS outbox row the gateway filed for a turn. */
-export type OutboxState = 'queued' | 'sending' | 'sent' | 'timeout' | 'failed' | 'answered';
+/**
+ * The delivery state of the CoS outbox row the gateway filed for a turn. A
+ * stopped turn mirrors to `cancelled`, the outbox's own word for a delivery
+ * that was called back and will never be sent.
+ */
+export type OutboxState = 'queued' | 'sending' | 'sent' | 'timeout' | 'failed' | 'answered' | 'cancelled';
 
 /** One persisted outbox/retry row. */
 export interface StoredOutboxRow {
