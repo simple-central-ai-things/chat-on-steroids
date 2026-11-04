@@ -11,6 +11,7 @@ records the wire contract; the code and `test/cos-gateway/` are the authority.
 - `GET /v1/models` — the account-observed catalog as an OpenAI model list.
 - `GET /v1/conversations` — read-only page of this instance's conversations.
 - `GET /v1/conversations/{id}/turns` — read-only page of one conversation's turns.
+- `POST /v1/conversations/{id}/turns/{turnId}/stop` — interrupt an in-flight turn.
 - `GET /v1/errors` — the published failure contract a pool in front decides on.
 - `POST /v1/chat/completions` — one CoS turn, answered whole (JSON) or streamed (SSE).
 
@@ -45,7 +46,9 @@ never believe a tool call was honored and then act on a hallucinated invocation.
 `GET /v1/conversations` and `GET /v1/conversations/{id}/turns` read what this
 instance already recorded in the H-043 state store. They never resolve a CoS
 session, send a message, open a browser or mutate state; there is deliberately no
-browser-action endpoint. The conversation id is the stored conversation key (URL-encoded
+browser-action endpoint. The one mutating turn route is the stop below; it
+interrupts only this process's follow and never drives the browser. The
+conversation id is the stored conversation key (URL-encoded
 in the turn route), and timestamps are epoch seconds.
 
 A conversation page lists `id`, `object: "conversation"`, `session`,
@@ -66,6 +69,46 @@ Scope matches `POST /v1/chat/completions`: a handle-scoped instance publishes on
 handle prefix. A conversation outside the scope is a `404 not_found` for the turn
 route, indistinguishable from a missing one, so a listing can never enumerate
 another account's conversations.
+
+## Stopping a turn
+
+`POST /v1/conversations/{id}/turns/{turnId}/stop` interrupts an in-flight turn
+and records the terminal `stopped` state. It is the only mutating store route
+besides a completion, and it never asks CoS to stop anything: it ends this
+process's follow, and the ChatGPT conversation keeps the answer CoS is recording.
+
+- **in flight** — signals the follower (the streaming or whole-answer request
+  waiting on that turn), records `state: "stopped"` on the turn row, mirrors the
+  outbox row to `cancelled`, clears the in-flight slot and consumes the
+  sequence. The follower aborts at its next poll: a stream ends with one
+  `data: {"error": {"code": "turn_stopped", …}}` frame and **without** `[DONE]`,
+  and a whole-answer request answers `409 turn_stopped`. The stop is checked
+  before every read and again before the answer is committed, so an answer that
+  became readable after the stop cannot revive the turn.
+- **already terminal** — a no-op returning the recorded turn. A repeated stop
+  never rewrites the state and never consumes another sequence.
+
+The response is the turn view (`object: "turn"`, `state`, `started_at`,
+`finished_at`, …) plus `changed`: `true` when this call stopped the turn,
+`false` when it was already terminal.
+
+Scope and errors match the turn listing: a conversation outside this instance's
+scope is never revealed. A key whose prefix names another handle this deployment
+defines is a deliberate cross-account attempt (`409 cross_handle_session`); any
+other foreign or unknown key, an unknown conversation and an unknown turn id in a
+known conversation are all `404 not_found`. The route needs the same
+`Authorization: Bearer $GATEWAY_API_KEY` as every other `/v1/*` route.
+
+The request following the turn holds the per-conversation lock for its whole
+lifetime, so the stop takes no lock: it is one synchronous turn of the event
+loop (signal, slot clear, record, persist, wake), and cannot interleave with the
+turn it stops. Consuming the sequence also means an identical completion body
+after a stop derives a fresh deterministic turn id: it is the next turn, never a
+replay or a resumed stopped one.
+
+SEALED has no representation inside this gateway. The SCPM router/provider
+enforces it in front, and this route inherits that decision rather than growing a
+local flag.
 
 ## Per-handle status (`/v1/handles`)
 
@@ -154,7 +197,9 @@ It stops the follower within one poll and:
   outcome `'timeout'`, re-attachable);
 - does **not** call `finishTurn` and never asks CoS to stop the turn. The turn
   belongs to the ChatGPT conversation; stopping it would break re-attachment and
-  throw away the answer that is being recorded anyway.
+  throw away the answer that is being recorded anyway. An explicit
+  `POST .../turns/{turnId}/stop` is the deliberate opposite (see **Stopping a
+  turn**): it is a terminal operator choice, not a disconnect.
 
 The next request for the same conversation re-attaches by input id, so the
 message is never sent twice and no answer is lost. This is the same path a
@@ -321,8 +366,10 @@ per `(code, status)`, agreement with the ledger and the classifier), cursor
 round-trips and refusals, page limits and 404s, chunked keyset paging over many
 rows, handle-scoped listing with cross-handle isolation on one state directory,
 `/v1/handles` readiness/catalog facts with no account detail, unknown-is-not-ready,
-and the `tools_unsupported` refusals. `/health`, `/v1/models` and
-`/v1/chat/completions` keep compatibility coverage alongside them.
+the `tools_unsupported` refusals, and the stop route (mid-flight interruption on
+both answer paths, the recorded-once terminal row, and an identical resend
+becoming a new turn). `/health`, `/v1/models` and `/v1/chat/completions` keep
+compatibility coverage alongside them.
 
 The H-044 offline acceptance matrix (`test/cos-gateway/http-matrix.test.ts`)
 drives the failure, restart and session-isolation behavior over real local HTTP
@@ -333,6 +380,15 @@ against fake-CoS:
   (`turn_ended_without_answer`, `not_delivered`), the `503`s
   (`shutting_down` even for `stream: true`, `models_not_ready`/`models_unknown`)
   and `504 turn_timeout` with the reattach advice;
+- stop: a mid-flight stream ends with a `turn_stopped` error frame and no
+  `[DONE]`, a whole-answer request answers `409 turn_stopped`, and a late answer
+  never revives the turn. The store is read back after the gateway stops to
+  prove the turn row is `stopped` and the outbox row `cancelled` exactly once,
+  the in-flight slot is clear, the sequence was consumed, and a repeated stop or
+  an identical resend changes nothing (the resend is a new turn). A terminal,
+  unknown, malformed or key-less stop answers the contract envelope, and a
+  cross-handle key is `409 cross_handle_session` without touching the turn. The
+  manager test also covers `settleLeftover` resolving a stopped leftover;
 - duplicate handling: a retry of an in-flight turn re-attaches by turn id and
   returns the recorded result without a second send, both after a `504` and
   when the anchor landed after the turn end (the `cc5aa19` keyed follow), while
