@@ -32,7 +32,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { foldDelta, foldFirst, FoldError, type NormalizedMessage } from './fold.js';
 import { GatewayStateStore } from './state/store.js';
-import type { ConversationState } from './state/schema.js';
+import type { ConversationState, ListedConversation, TurnCursor, StoredTurn } from './state/schema.js';
 import {
   gatewayError,
   mapChatError,
@@ -348,6 +348,37 @@ export class TurnManager {
   ownerOfSession(sessionId: string): string | null {
     this.ensureLoaded();
     return this.store.conversationForSession(sessionId);
+  }
+
+  // --------------------------------------------------------- read-only listing
+  //
+  // H-045 exposes the H-043 store for reading through the manager, so the store
+  // stays private and a listing can never mutate a conversation, resolve a CoS
+  // session or open a browser. Each call is a bounded page, not a whole table.
+
+  /** One page of conversations, filtered before the page is cut. */
+  conversationsPage(options: {
+    after?: string | null;
+    limit: number;
+    accept?: (conversation: ListedConversation) => boolean;
+  }): { conversations: ListedConversation[]; hasMore: boolean } {
+    this.ensureLoaded();
+    return this.store.conversationsPage(options);
+  }
+
+  /** Whether this gateway already knows the conversation, without reading state. */
+  hasConversation(conversationKey: string): boolean {
+    this.ensureLoaded();
+    return this.store.hasConversation(conversationKey);
+  }
+
+  /** One page of a conversation's turns in `(seq, started_at, turn_id)` order. */
+  turnsPage(
+    conversationKey: string,
+    options: { after?: TurnCursor | null; limit: number },
+  ): { turns: StoredTurn[]; hasMore: boolean } {
+    this.ensureLoaded();
+    return this.store.turnsPage(conversationKey, options);
   }
 
   /** Persist the conversation this state belongs to (full flush if untracked). */

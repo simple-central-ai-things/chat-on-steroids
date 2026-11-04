@@ -52,6 +52,11 @@ export const GATEWAY_ERRORS = {
   body_too_large: { status: 413, message: 'the request body is too large' },
   invalid_json: { status: 400, message: 'the request body is not valid JSON' },
   invalid_body: { status: 400, message: 'the request body is not a valid chat request' },
+  invalid_cursor: { status: 400, message: 'the pagination cursor is not one this gateway issued' },
+  tools_unsupported: {
+    status: 400,
+    message: 'tool and function calls are not supported by this gateway; send a plain chat completion'
+  },
   invalid_reasoning_effort: { status: 400, message: 'reasoning_effort is not one of the efforts ChatGPT offers' },
   model_unknown: { status: 400, message: 'GET /v1/models lists the models this account offers' },
   effort_unavailable: { status: 400, message: 'the model does not offer that reasoning effort' },

@@ -27,14 +27,23 @@ test('the catalog maps to OpenAI model objects with plain ids', () => {
     object: 'model',
     created: 1_730_000_000,
     owned_by: 'chat-on-steroids',
-    efforts: ['minimal', 'low', 'medium', 'high']
+    efforts: ['minimal', 'low', 'medium', 'high'],
+    capabilities: {
+      context_window: null,
+      max_output_tokens: null,
+      reasoning_efforts: ['minimal', 'low', 'medium', 'high'],
+      tool_calls: false
+    }
   });
   for (const model of models) {
     assert.ok(!model.id.startsWith('cos/'), 'ids must not carry the cos/ prefix');
     assert.equal(model.object, 'model');
-    // A model card claims only what CoS observed: no invented context window or
-    // max-output figure (CoS does not know them). efforts is all we add.
-    assert.deepEqual(Object.keys(model).sort(), ['created', 'efforts', 'id', 'object', 'owned_by'].sort());
+    // A model card claims only what CoS observed: unknown capabilities stay
+    // null, and tool calls stay false until a CoS source contract verifies them.
+    assert.deepEqual(
+      Object.keys(model).sort(),
+      ['capabilities', 'created', 'efforts', 'id', 'object', 'owned_by'].sort()
+    );
   }
 });
 

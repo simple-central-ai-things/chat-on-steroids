@@ -52,6 +52,24 @@ export interface OpenAiModel {
    * it lets ChatGPT choose on its composer auto lane.
    */
   efforts: readonly ReasoningEffort[];
+  /**
+   * The capability facts this card can prove. Only values CoS observed are
+   * published; everything else stays `null` (unknown), never a guess. Tool
+   * calls are `false` because no CoS source contract verifies them (H-045).
+   */
+  capabilities: ModelCapabilities;
+}
+
+/** One model's provable capabilities. Unknown is `null`, never an estimate. */
+export interface ModelCapabilities {
+  /** CoS does not observe a context window: always null today. */
+  context_window: number | null;
+  /** CoS does not observe a max-output figure: always null today. */
+  max_output_tokens: number | null;
+  /** The reasoning efforts the picker offered for this model. */
+  reasoning_efforts: readonly ReasoningEffort[];
+  /** Never true: tool/function calls are UNSUPPORTED until CoS verifies them. */
+  tool_calls: false;
 }
 
 /**
@@ -69,7 +87,13 @@ export function openAiModels(catalog: ChatModelCatalog, handle?: string | null):
     object: 'model' as const,
     created,
     owned_by: 'chat-on-steroids',
-    efforts: option.efforts
+    efforts: option.efforts,
+    capabilities: {
+      context_window: null,
+      max_output_tokens: null,
+      reasoning_efforts: option.efforts,
+      tool_calls: false
+    }
   }));
 }
 

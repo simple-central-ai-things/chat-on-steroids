@@ -45,6 +45,11 @@ import {
   type GatewayErrorData,
   GatewayError
 } from './errors.js';
+import { ERROR_CONTRACT, ERROR_CONTRACT_VERSION } from './contract.js';
+import {
+  listConversations,
+  listTurns
+} from './listing.js';
 import {
   completionId,
   SessionBusy,
@@ -269,7 +274,10 @@ async function handleRequest(
   config: GatewayConfig,
   manager: TurnManager,
 ): Promise<void> {
-  const url = (req.url ?? '/').split('?')[0]!;
+  const target = req.url ?? '/';
+  const questionAt = target.indexOf('?');
+  const url = questionAt < 0 ? target : target.slice(0, questionAt);
+  const query = new URLSearchParams(questionAt < 0 ? '' : target.slice(questionAt + 1));
   if (req.method === 'GET' && url === '/health') {
     send(res, 200, { ok: true, protocol: PROTOCOL, authenticated: config.apiKey !== null });
     return;
@@ -307,6 +315,39 @@ async function handleRequest(
   }
   if (req.method === 'GET' && url === '/v1/models') {
     await handleModels(res, internals, config);
+    return;
+  }
+  if (req.method === 'GET' && url === '/v1/errors') {
+    // The published failure contract: one row per (code, status) the ledger can
+    // answer, so a pool in front of the instances can decide `wait`, `failover`,
+    // `reattach` or `stop` from the same table the gateway enforces.
+    send(res, 200, {
+      object: 'list',
+      contract_version: ERROR_CONTRACT_VERSION,
+      data: ERROR_CONTRACT
+    });
+    return;
+  }
+  if (req.method === 'GET' && url === '/v1/handles') {
+    await handleHandles(res, internals, config);
+    return;
+  }
+  if (req.method === 'GET' && url === '/v1/conversations') {
+    // Read-only listing over the H-043 store: this instance's scope only, with
+    // keyset pagination. It never resolves a session or sends anything.
+    send(res, 200, listConversations(manager, servingHandle(config), query));
+    return;
+  }
+  const turnsRoute = /^\/v1\/conversations\/([^/]+)\/turns$/.exec(url);
+  if (req.method === 'GET' && turnsRoute !== null) {
+    let conversationKey: string;
+    try {
+      conversationKey = decodeURIComponent(turnsRoute[1]!);
+    } catch {
+      // A malformed escape is not a conversation this gateway ever published.
+      throw gatewayError('not_found', 'no such conversation');
+    }
+    send(res, 200, listTurns(manager, servingHandle(config), conversationKey, query));
     return;
   }
   if (req.method === 'POST' && url === '/v1/chat/completions') {
@@ -410,12 +451,121 @@ async function handleModels(
   send(res, 200, { object: 'list', data: openAiModels(catalog, config.serving?.local.handle ?? null) });
 }
 
+/** The handle this instance serves, or null in single-account mode. */
+function servingHandle(config: GatewayConfig): string | null {
+  return config.serving?.local.handle ?? null;
+}
+
+const NO_HANDLE_EVIDENCE = { signedIn: null, browserRunning: null, extensionFresh: null } as const;
+
+/**
+ * Per-handle status and entitlement (platform spec D4 / H-045).
+ *
+ * The local handle's readiness comes from the same LIVE browser evidence the
+ * completions gate uses (`assessReadiness`), so unknown is never ready. Its
+ * catalog facts are the ones CoS actually observed, with the age of that
+ * observation. Another handle is not observable from this process, so it is
+ * `unknown`, never ready, and carries no account detail at all.
+ *
+ * `processing_attested` is false everywhere and for a reason: this endpoint
+ * reports what a browser and a catalog proved, never that a request was
+ * processed locally.
+ */
+async function handleHandles(
+  res: ServerResponse,
+  internals: CosInternals,
+  config: GatewayConfig,
+): Promise<void> {
+  if (config.serving === null) {
+    send(res, 200, { object: 'list', processing_attested: false, data: [] });
+    return;
+  }
+  const proof = internals.externalBrowserProof();
+  const live = await internals.liveChatGptEvidence();
+  const catalog = internals.getChatModels();
+  const evidence = {
+    signedIn: proof?.signedIn ?? null,
+    browserRunning: live.browserRunning,
+    extensionFresh: live.extensionFresh
+  };
+  const observedAt = catalog.observedAt;
+  const ageSeconds = observedAt === null
+    ? null
+    : Math.max(0, Math.floor((Date.now() - observedAt) / 1000));
+  const local = config.serving.local;
+  const readiness = assessReadiness(local, evidence);
+  const data = config.serving.registry.list().map((handle) => {
+    if (handle.handle !== local.handle) {
+      // This process owns one account. Another handle's readiness is unknown to
+      // it, and nothing about that account (label, profile, keyring) rides along.
+      return {
+        handle: handle.handle,
+        object: 'handle',
+        local: false,
+        status: 'unknown',
+        ready: false,
+        reason: 'this instance cannot observe another handle',
+        evidence: NO_HANDLE_EVIDENCE,
+        catalog: null
+      };
+    }
+    return {
+      ...publicHandleView(readiness),
+      object: 'handle',
+      local: true,
+      // The raw live signals, so the status is auditable rather than asserted.
+      evidence,
+      catalog: {
+        state: catalog.state,
+        observed_at: observedAt === null ? null : Math.floor(observedAt / 1000),
+        age_seconds: ageSeconds,
+        // Base ids only: the per-handle entitlement, not another handle's view.
+        models: catalogModels(catalog)
+      }
+    };
+  });
+  send(res, 200, { object: 'list', processing_attested: false, data });
+}
+
 interface CompletionRequest {
   model?: unknown;
   messages?: unknown;
   reasoning_effort?: unknown;
   stream?: unknown;
   include_system?: unknown;
+  // Accepted only to refuse them: no CoS source contract verifies tool/function
+  // calls, so the gateway documents them UNSUPPORTED instead of simulating them.
+  tools?: unknown;
+  functions?: unknown;
+  tool_choice?: unknown;
+  function_call?: unknown;
+}
+
+/**
+ * Tool and function calls are UNSUPPORTED (platform spec D4 / H-045): CoS keeps
+ * model execution in ChatGPT's own conversation, and no local contract verifies
+ * a tool-call round trip. A non-empty `tools`/`functions` list, or any
+ * `tool_choice`/`function_call` other than absent/null/'none', is refused with
+ * a clear 400 instead of being silently ignored — a client must never believe a
+ * tool call was supported and then act on a hallucinated invocation.
+ *
+ * An empty list is valid and means the caller sent no tools; a present
+ * non-array is a malformed body, not an unsupported feature.
+ */
+function refuseToolCalls(body: CompletionRequest): void {
+  for (const field of ['tools', 'functions'] as const) {
+    const value = body[field];
+    if (value === undefined) continue;
+    if (!Array.isArray(value)) {
+      throw gatewayError('invalid_body', `${field} must be an array when present`);
+    }
+    if (value.length > 0) throw gatewayError('tools_unsupported');
+  }
+  for (const field of ['tool_choice', 'function_call'] as const) {
+    const value = body[field];
+    if (value === undefined || value === null || value === 'none') continue;
+    throw gatewayError('tools_unsupported');
+  }
 }
 
 async function handleCompletions(
@@ -432,6 +582,9 @@ async function handleCompletions(
   } catch {
     throw gatewayError('invalid_json');
   }
+  // Refused before handle identity, readiness or the catalog: the request shape
+  // is wrong for this gateway whatever account it names.
+  refuseToolCalls(body);
 
   // Which account this request is for. `<model>@cos-<handle>` names a handle;
   // this instance serves exactly one. Another handle's identity is a routing

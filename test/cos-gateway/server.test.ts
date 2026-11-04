@@ -452,12 +452,27 @@ test('GET /v1/models returns model cards with only the efforts CoS observed', as
     object: 'model',
     created: 1_730_000_000,
     owned_by: 'chat-on-steroids',
-    efforts: ['low', 'high']
+    efforts: ['low', 'high'],
+    capabilities: {
+      context_window: null,
+      max_output_tokens: null,
+      reasoning_efforts: ['low', 'high'],
+      tool_calls: false
+    }
   });
   // CoS does not know a context window or a max-output figure; the card must
-  // not invent them (the task forbids it).
-  assert.equal('context_window' in card, false);
-  assert.equal('max_output_tokens' in card, false);
+  // publish them as null (unknown), never invent a number (the task forbids it).
+  const capabilities = card.capabilities as {
+    context_window: unknown;
+    max_output_tokens: unknown;
+    reasoning_efforts: unknown;
+    tool_calls: unknown;
+  };
+  assert.equal(capabilities.context_window, null);
+  assert.equal(capabilities.max_output_tokens, null);
+  assert.deepEqual(capabilities.reasoning_efforts, ['low', 'high']);
+  // Tool calls are UNSUPPORTED until a CoS source contract verifies them.
+  assert.equal(capabilities.tool_calls, false);
   assert.equal('context_length' in card, false);
 
   // A model with no observed efforts still answers; null effort means ChatGPT's

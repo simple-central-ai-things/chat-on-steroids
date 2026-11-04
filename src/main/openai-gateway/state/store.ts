@@ -85,9 +85,11 @@ import {
   type ImportRecord,
   type LegacyConversationRow,
   type LegacyStateMap,
+  type ListedConversation,
   type OutboxState,
   type StoredOutboxRow,
   type StoredTurn,
+  type TurnCursor,
   type TurnState
 } from './schema.js';
 
@@ -551,6 +553,78 @@ export class GatewayStateStore {
     );
   }
 
+  // ------------------------------------------------------------ public reads
+
+  /**
+   * One page of conversations in `conversation_key` order, after `after`
+   * (exclusive). Rows are scanned in bounded chunks and filtered by `accept`,
+   * so a handle-scoped listing never materializes the whole table, and an
+   * empty chunk can never end the scan while a later chunk still matches.
+   *
+   * Read-only: no write and no shadow export. `hasMore` is true only when an
+   * accepted row exists past the returned page, which is exactly the case the
+   * exclusive cursor can continue from.
+   */
+  conversationsPage(options: {
+    after?: string | null;
+    limit: number;
+    accept?: (conversation: ListedConversation) => boolean;
+  }): { conversations: ListedConversation[]; hasMore: boolean } {
+    this.assertOpen();
+    const accept = options.accept ?? (() => true);
+    const limit = Math.max(1, options.limit);
+    const conversations: ListedConversation[] = [];
+    let after = options.after ?? null;
+    for (;;) {
+      const rows = (after === null
+        ? this.stmt(LISTING_FIRST_SELECT).all(LISTING_CHUNK)
+        : this.stmt(LISTING_AFTER_SELECT).all(after, LISTING_CHUNK)) as unknown as RawConversationRow[];
+      if (rows.length === 0) break;
+      for (const row of rows) {
+        const conversation = listedFromRow(row);
+        if (conversation === null) continue;
+        after = conversation.conversationKey;
+        if (!accept(conversation)) continue;
+        if (conversations.length === limit) return { conversations, hasMore: true };
+        conversations.push(conversation);
+      }
+      if (rows.length < LISTING_CHUNK) break;
+    }
+    return { conversations, hasMore: false };
+  }
+
+  /** Whether a conversation row exists, without reading its state. */
+  hasConversation(conversationKey: string): boolean {
+    this.assertOpen();
+    return this.stmt('SELECT 1 AS present FROM conversations WHERE conversation_key = ?')
+      .get(conversationKey) !== undefined;
+  }
+
+  /**
+   * One page of a conversation's turns in `(seq, started_at, turn_id)` order,
+   * after `after` (exclusive). The composite cursor is a total order, so a
+   * page boundary can never skip or repeat a row even when two turns share a
+   * sequence. Read-only.
+   */
+  turnsPage(
+    conversationKey: string,
+    options: { after?: TurnCursor | null; limit: number },
+  ): { turns: StoredTurn[]; hasMore: boolean } {
+    this.assertOpen();
+    const limit = Math.max(1, options.limit);
+    const after = options.after ?? null;
+    const rows = (after === null
+      ? this.stmt(TURN_PAGE_FIRST_SELECT).all(conversationKey, limit + 1)
+      : this.stmt(TURN_PAGE_AFTER_SELECT).all(
+          conversationKey,
+          after.seq, after.seq, after.startedAt,
+          after.seq, after.startedAt, after.turnId,
+          limit + 1
+        )) as unknown as RawTurnRow[];
+    const turns = rows.map(turnFromRow);
+    return { turns: turns.slice(0, limit), hasMore: turns.length > limit };
+  }
+
   // ---------------------------------------------------------------- sessions
 
   /** The conversation a CoS session belongs to, or null when unseen. */
@@ -676,11 +750,52 @@ LEFT JOIN in_flight f ON f.conversation_key = c.conversation_key
 ORDER BY c.conversation_key
 `;
 
+/**
+ * The read-only listing projection. Same join as CONVERSATION_SELECT, but the
+ * budget comes from LIMIT so a page is bounded before any filtering happens.
+ */
+const LISTING_SELECT = `
+SELECT c.conversation_key, c.session_id, c.sent_users, c.turn_seq, c.updated_at,
+       f.turn_id AS in_flight_turn, f.started_at AS in_flight_started
+FROM conversations c
+LEFT JOIN in_flight f ON f.conversation_key = c.conversation_key
+`;
+
+const LISTING_FIRST_SELECT = `${LISTING_SELECT}
+ORDER BY c.conversation_key
+LIMIT ?
+`;
+
+const LISTING_AFTER_SELECT = `${LISTING_SELECT}
+WHERE c.conversation_key > ?
+ORDER BY c.conversation_key
+LIMIT ?
+`;
+
+/** Rows read per scan chunk; a page may have to cross several to fill up. */
+const LISTING_CHUNK = 200;
+
+const TURN_PAGE_FIRST_SELECT = `
+SELECT * FROM turns
+WHERE conversation_key = ?
+ORDER BY seq, started_at, turn_id
+LIMIT ?
+`;
+
+const TURN_PAGE_AFTER_SELECT = `
+SELECT * FROM turns
+WHERE conversation_key = ?
+  AND (seq > ? OR (seq = ? AND started_at > ?) OR (seq = ? AND started_at = ? AND turn_id > ?))
+ORDER BY seq, started_at, turn_id
+LIMIT ?
+`;
+
 interface RawConversationRow {
   conversation_key?: unknown;
   session_id?: unknown;
   sent_users?: unknown;
   turn_seq?: unknown;
+  updated_at?: unknown;
   in_flight_turn?: unknown;
   in_flight_started?: unknown;
 }
@@ -726,6 +841,22 @@ function conversationFromRow(row: RawConversationRow): ConversationState {
       ? null
       : integer(row.in_flight_started, 0),
     turnSeq: integer(row.turn_seq, 0)
+  };
+}
+
+function listedFromRow(row: RawConversationRow): ListedConversation | null {
+  const conversationKey = text(row.conversation_key);
+  if (conversationKey === null) return null;
+  return {
+    conversationKey,
+    sessionId: text(row.session_id),
+    sentUsers: integer(row.sent_users, 0),
+    turnSeq: integer(row.turn_seq, 0),
+    updatedAt: integer(row.updated_at, 0),
+    inFlightTurnId: text(row.in_flight_turn),
+    inFlightStartedAt: row.in_flight_turn === null || row.in_flight_turn === undefined
+      ? null
+      : integer(row.in_flight_started, 0)
   };
 }
 

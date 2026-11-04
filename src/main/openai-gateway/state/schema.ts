@@ -59,6 +59,29 @@ export interface ConversationState {
 /** A logical turn's lifecycle. `in_flight` is the only non-terminal state. */
 export type TurnState = 'in_flight' | 'answered' | 'failed' | 'timeout' | 'settled';
 
+/**
+ * One conversation as the read-only listing reads it: the persisted row plus
+ * the in-flight slot and the last write time. Listing never mutates state and
+ * never resolves a CoS session; it is the H-043 store's public read shape.
+ */
+export interface ListedConversation {
+  conversationKey: string;
+  sessionId: string | null;
+  sentUsers: number;
+  turnSeq: number;
+  /** Epoch milliseconds of the last committed write to the row. */
+  updatedAt: number;
+  inFlightTurnId: string | null;
+  inFlightStartedAt: number | null;
+}
+
+/** One turn's position in the `(seq, started_at, turn_id)` listing order. */
+export interface TurnCursor {
+  seq: number;
+  startedAt: number;
+  turnId: string;
+}
+
 /** One persisted turn row. */
 export interface StoredTurn {
   turnId: string;
