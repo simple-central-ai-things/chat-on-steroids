@@ -273,7 +273,7 @@ test('session keys are handle-scoped: a handle refuses to adopt another handle\'
   const work = await startGateway(workFake, configFor({ handles: handlesFixture(), handle: 'work' }), stateDir);
   const sessionId = 'sess-shared-fixture';
 
-  const first = post(work, { messages: [{ role: 'user', content: 'Opener' }] }, { 'x-cos-session': 'sess-shared-fixture' });
+  const first = post(work, { messages: [{ role: 'user', content: 'Opener' }] }, { 'x-cos-session': sessionId });
   await waitFor(() => workFake.sent.length === 1);
   // The CoS session id this account's turn created; home must never adopt it.
   const workSessionId = workFake.sent[0]!.id;
