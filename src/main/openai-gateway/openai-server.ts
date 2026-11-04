@@ -13,6 +13,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import {
   openAiModels,
   resolveModelChoice,
@@ -20,6 +21,21 @@ import {
   type ChatModelCatalog,
   type ReasoningEffort
 } from './catalog.js';
+import {
+  assessReadiness,
+  buildDeploymentMap,
+  handleOfConversationKey,
+  HandleRegistry,
+  HandleRegistryError,
+  publicHandleView,
+  resolveIdentity,
+  scopedConversationKey,
+  SERVED_BY_HEADER,
+  servedByValue,
+  type Handle,
+  type HandleReadiness,
+  type ServedIdentity
+} from './handles.js';
 import { conversationKey, normalizeMessages, FoldError, type NormalizedMessage } from './fold.js';
 import {
   errorBody,
@@ -53,6 +69,70 @@ export interface GatewayConfig {
   includeSystem: boolean;
   /** SSE comment interval while a streamed turn records nothing; 0 disables. */
   streamHeartbeatMs: number;
+  /**
+   * The handle this instance serves, when the deployment configures handles.
+   * null is the single-account mode: bare model ids, no handle identity.
+   */
+  serving: HandleServing | null;
+  /**
+   * Why the handle configuration was rejected. Never sent to a client (it can
+   * spell out account paths); it is logged at startup and every /v1/* request
+   * answers a generic 503 until the deploy config is fixed.
+   */
+  handleError: string | null;
+}
+
+/** The validated registry plus the one handle this process owns. */
+export interface HandleServing {
+  registry: HandleRegistry;
+  local: Handle;
+}
+
+/**
+ * Read and validate the handle deployment from the environment.
+ *
+ *   GATEWAY_HANDLES       inline JSON handle list (array or { handles: [...] })
+ *   GATEWAY_HANDLES_FILE  path to the same document (preferred at deploy time)
+ *   GATEWAY_HANDLE        the handle THIS instance serves
+ *
+ * No handle config at all keeps the single-account behavior byte for byte.
+ * A config that does not validate, or one that names no/local-serving handle,
+ * is reported as `handleError` and the gateway refuses to serve: starting a
+ * half-configured handle is worse than starting none.
+ */
+function handleServingFromEnv(env: NodeJS.ProcessEnv): { serving: HandleServing | null; error: string | null } {
+  const inline = (env.GATEWAY_HANDLES ?? '').trim();
+  const file = (env.GATEWAY_HANDLES_FILE ?? '').trim();
+  if (inline === '' && file === '') return { serving: null, error: null };
+  let raw: unknown;
+  try {
+    const document = inline !== '' ? inline : readFileSync(file, 'utf8');
+    raw = JSON.parse(document) as unknown;
+  } catch (error) {
+    return { serving: null, error: `the handle registry could not be read: ${describe(error)}` };
+  }
+  let registry: HandleRegistry;
+  try {
+    registry = HandleRegistry.parse(raw);
+  } catch (error) {
+    return {
+      serving: null,
+      error: error instanceof HandleRegistryError ? error.message : `the handle registry is invalid: ${describe(error)}`
+    };
+  }
+  const name = (env.GATEWAY_HANDLE ?? '').trim();
+  if (name === '') {
+    return { serving: null, error: 'GATEWAY_HANDLE must name the handle this instance serves' };
+  }
+  try {
+    return { serving: { registry, local: registry.local(name) }, error: null };
+  } catch (error) {
+    return { serving: null, error: describe(error) };
+  }
+}
+
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export function gatewayConfigFromEnv(env: NodeJS.ProcessEnv): GatewayConfig {
@@ -65,6 +145,7 @@ export function gatewayConfigFromEnv(env: NodeJS.ProcessEnv): GatewayConfig {
   const heartbeatRaw = env.STREAM_HEARTBEAT_SECONDS;
   const heartbeatSeconds =
     heartbeatRaw !== undefined && heartbeatRaw !== '' ? Number.parseInt(heartbeatRaw, 10) : 15;
+  const handles = handleServingFromEnv(env);
   return {
     port: Number.isSafeInteger(port) && port >= 0 && port < 65536 ? port : 8793,
     apiKey: apiKey !== undefined && apiKey.length > 0 ? apiKey : null,
@@ -74,7 +155,9 @@ export function gatewayConfigFromEnv(env: NodeJS.ProcessEnv): GatewayConfig {
     includeSystem: env.GATEWAY_INCLUDE_SYSTEM !== '0' && env.GATEWAY_INCLUDE_SYSTEM !== 'false',
     streamHeartbeatMs: Number.isSafeInteger(heartbeatSeconds) && heartbeatSeconds > 0
       ? heartbeatSeconds * 1000
-      : 0
+      : 0,
+    serving: handles.serving,
+    handleError: handles.error
   };
 }
 
@@ -100,6 +183,12 @@ export function startOpenAiServer(
   options: { stateDir: string; log?: (line: string) => void; managerOptions?: TurnManagerOptions },
 ): Promise<OpenAiServer> {
   const log = options.log ?? (() => undefined);
+  if (config.handleError !== null) {
+    // Operator detail only: it can name account paths and never leaves this log.
+    log(`gateway handle configuration rejected: ${config.handleError}`);
+  } else if (config.serving !== null) {
+    log(`gateway serves handle '${config.serving.local.handle}'`);
+  }
   const manager = new TurnManager(internals, options.stateDir, {
     turnTimeoutMs: config.turnTimeoutSeconds * 1000,
     ...(options.managerOptions ?? {})
@@ -201,12 +290,23 @@ async function handleRequest(
     send(res, 401, errorBody({ status: 401, code: 'unauthorized', message: 'bearer key required' }));
     return;
   }
+  // Which handle answered, for an authenticated caller: the operator's alias
+  // only (never the account label, profile, userData or keyring).
+  if (config.serving !== null) {
+    res.setHeader(SERVED_BY_HEADER, servedByValue(config.serving.local.handle));
+  }
+  if (config.handleError !== null) {
+    // Fail closed on a rejected handle config, with the static message: the
+    // detail names account paths and stays in the startup log.
+    send(res, 503, errorBody(gatewayError('handle_registry_invalid')));
+    return;
+  }
   if (req.method === 'GET' && url === '/v1/status') {
-    await handleStatus(res, internals);
+    await handleStatus(res, internals, config);
     return;
   }
   if (req.method === 'GET' && url === '/v1/models') {
-    await handleModels(res, internals);
+    await handleModels(res, internals, config);
     return;
   }
   if (req.method === 'POST' && url === '/v1/chat/completions') {
@@ -235,7 +335,11 @@ function authorized(req: IncomingMessage, apiKey: string): boolean {
  * the extension is fresh; false when any side says no; null when anything is
  * unobserved. null never means "signed out".
  */
-async function handleStatus(res: ServerResponse, internals: CosInternals): Promise<void> {
+async function handleStatus(
+  res: ServerResponse,
+  internals: CosInternals,
+  config: GatewayConfig,
+): Promise<void> {
   const proof = internals.externalBrowserProof();
   const live = await internals.liveChatGptEvidence();
   const catalog = internals.getChatModels();
@@ -252,7 +356,7 @@ async function handleStatus(res: ServerResponse, internals: CosInternals): Promi
       : signedIn === false || browserRunning === false || extensionFresh === false
         ? false
         : null;
-  send(res, 200, {
+  const body: Record<string, unknown> = {
     ok: true,
     protocol: PROTOCOL,
     chatgpt: {
@@ -265,10 +369,36 @@ async function handleStatus(res: ServerResponse, internals: CosInternals): Promi
       observedAt: catalog.observedAt,
       models: catalog.models.length
     }
-  });
+  };
+  if (config.serving !== null) {
+    const readiness = assessReadiness(config.serving.local, {
+      signedIn, browserRunning, extensionFresh
+    });
+    body.handle = {
+      ...publicHandleView(readiness),
+      // The deployment map this instance can prove: its own handle carries the
+      // observed catalog, every other handle's readiness is unknown (never
+      // served by guesswork) and no account detail rides along.
+      deployment: buildDeploymentMap(
+        config.serving.registry,
+        new Map<string, HandleReadiness>([[readiness.handle, readiness]]),
+        new Map([[readiness.handle, catalogModels(catalog)]])
+      )
+    };
+  }
+  send(res, 200, body);
 }
 
-async function handleModels(res: ServerResponse, internals: CosInternals): Promise<void> {
+/** The base model ids a ready catalog offers; empty while it is not ready. */
+function catalogModels(catalog: ChatModelCatalog): readonly string[] {
+  return catalog.state === 'ready' ? catalog.models.map((model) => model.id) : [];
+}
+
+async function handleModels(
+  res: ServerResponse,
+  internals: CosInternals,
+  config: GatewayConfig,
+): Promise<void> {
   const catalog = internals.getChatModels();
   if (catalog.state !== 'ready') {
     send(res, 503, errorBody({
@@ -277,7 +407,7 @@ async function handleModels(res: ServerResponse, internals: CosInternals): Promi
     }));
     return;
   }
-  send(res, 200, { object: 'list', data: openAiModels(catalog) });
+  send(res, 200, { object: 'list', data: openAiModels(catalog, config.serving?.local.handle ?? null) });
 }
 
 interface CompletionRequest {
@@ -303,6 +433,34 @@ async function handleCompletions(
     throw gatewayError('invalid_json');
   }
 
+  // Which account this request is for. `<model>@cos-<handle>` names a handle;
+  // this instance serves exactly one. Another handle's identity is a routing
+  // error (answered before anything is read from the catalog or sent), and an
+  // unknown or disabled handle is refused outright.
+  const served: ServedIdentity | null = config.serving === null
+    ? null
+    : resolveIdentity(
+        config.serving.registry,
+        config.serving.local.handle,
+        typeof body.model === 'string' ? body.model : null,
+      );
+
+  // Per-handle readiness from LIVE browser evidence. Unknown is not ready: a
+  // request must not be admitted into an account nobody has proven is signed
+  // in, or the turn goes nowhere and the message stays in the outbox.
+  if (served !== null) {
+    const live = await internals.liveChatGptEvidence();
+    const readiness = assessReadiness(served.handle, {
+      signedIn: internals.externalBrowserProof()?.signedIn ?? null,
+      browserRunning: live.browserRunning,
+      extensionFresh: live.extensionFresh
+    });
+    if (!readiness.ready) {
+      throw gatewayError('handle_not_ready',
+        `handle '${readiness.handle}' is not ready: ${readiness.reason}`);
+    }
+  }
+
   const normalized: NormalizedMessage[] =
     ((): NormalizedMessage[] => {
       try {
@@ -326,15 +484,30 @@ async function handleCompletions(
     : config.includeSystem;
   const selection = resolveModelChoice(
     internals.getChatModels(),
-    typeof body.model === 'string' ? body.model : null,
+    served !== null ? served.model : (typeof body.model === 'string' ? body.model : null),
     body.reasoning_effort as ReasoningEffort | null | undefined,
   );
+  // Conversation, session and retry keys are scoped BY HANDLE, so the same
+  // message on two accounts is two conversations and a retry can only ever
+  // re-attach to a turn of the handle that owns it.
   let key: string;
   try {
-    key = conversationKey(normalized, sessionOverride(req));
+    const folded = conversationKey(normalized, sessionOverride(req));
+    key = served === null ? folded : scopedConversationKey(served.handle.handle, folded);
   } catch (error) {
     if (error instanceof FoldError) throw gatewayError('invalid_body', error.message);
     throw error;
+  }
+  if (served !== null) {
+    const named = sessionOverride(req);
+    const owner = named === null ? null : manager.ownerOfSession(named);
+    if (owner !== null && handleOfConversationKey(owner) !== served.handle.handle) {
+      // Defense in depth against two instances pointed at one state directory:
+      // adopting the session would send this account's next message into the
+      // other account's ChatGPT conversation.
+      throw gatewayError('cross_handle_session',
+        `session '${named}' is bound to another handle; a handle never adopts another account's conversation`);
+    }
   }
 
   const { info, release } = await busyAsError(manager.acquire(key));

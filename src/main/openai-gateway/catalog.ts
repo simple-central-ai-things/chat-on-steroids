@@ -54,11 +54,18 @@ export interface OpenAiModel {
   efforts: readonly ReasoningEffort[];
 }
 
-/** The picker catalog as an OpenAI model list; plain ids, no 'cos/' prefix. */
-export function openAiModels(catalog: ChatModelCatalog): OpenAiModel[] {
+/**
+ * The picker catalog as an OpenAI model list; plain ids, no 'cos/' prefix.
+ * With a handle, every id is the deployment identity `<model>@cos-<handle>`
+ * (H-042): the same model id on two handles is two different accounts, and a
+ * list that dropped the suffix could not tell them apart.
+ */
+export function openAiModels(catalog: ChatModelCatalog, handle?: string | null): OpenAiModel[] {
   const created = catalog.observedAt !== null ? Math.floor(catalog.observedAt / 1000) : 0;
+  const identity = (id: string): string =>
+    handle === undefined || handle === null ? id : `${id}@cos-${handle}`;
   return catalog.models.map((option) => ({
-    id: option.id,
+    id: identity(option.id),
     object: 'model' as const,
     created,
     owned_by: 'chat-on-steroids',

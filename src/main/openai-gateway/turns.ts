@@ -339,6 +339,17 @@ export class TurnManager {
     return null;
   }
 
+  /**
+   * The conversation key a CoS session is already bound to, or null when this
+   * gateway has never seen it. Conversation keys are handle-scoped (H-042), so
+   * the handle layer can tell "our session" from "another handle's session"
+   * without a second authority: a foreign owner is a different key prefix.
+   */
+  ownerOfSession(sessionId: string): string | null {
+    this.ensureLoaded();
+    return this.store.conversationForSession(sessionId);
+  }
+
   /** Persist the conversation this state belongs to (full flush if untracked). */
   private persistFor(info: SessionInfo): void {
     const key = this.keyOf(info);

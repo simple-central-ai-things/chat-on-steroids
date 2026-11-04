@@ -5,14 +5,17 @@
  * reference for which literals are actionable (control-actions.ts:98-109).
  * This mapping re-expresses them as OpenAI-style errors for the gateway:
  *
- *   400  invalid OpenAI body, unknown model, unavailable effort
- *   409  id_conflict (a retry with a changed payload)
+ *   400  invalid OpenAI body, unknown model, unavailable effort, unknown
+ *        handle, an identity this instance does not serve
+ *   403  the handle named by the request is disabled by the operator
+ *   409  id_conflict (a retry with a changed payload), a CoS session already
+ *        bound to another handle's conversation
  *   429  busy / would_interrupt / session busy (Retry-After always set),
  *        chat_error with retryAt (Retry-After from the deadline)
  *   502  the upstream chat is unusable (no_chat, chat_blocked), a turn that
  *        ended without an answer, an input row that never got delivered
  *   503  CoS itself unavailable: shutting_down, queue_full, models_unknown,
- *        or the catalog not ready
+ *        the catalog not ready, or a handle that is not proven ready
  *   504  the turn did not finish in TURN_TIMEOUT_SECONDS; it keeps running
  *        and a later request re-attaches to it by input id
  *
@@ -52,6 +55,10 @@ export const GATEWAY_ERRORS = {
   invalid_reasoning_effort: { status: 400, message: 'reasoning_effort is not one of the efforts ChatGPT offers' },
   model_unknown: { status: 400, message: 'GET /v1/models lists the models this account offers' },
   effort_unavailable: { status: 400, message: 'the model does not offer that reasoning effort' },
+  handle_unknown: { status: 400, message: 'the model identity names no handle of this deployment' },
+  handle_mismatch: { status: 400, message: 'this instance serves a different handle' },
+  handle_disabled: { status: 403, message: 'the handle is disabled by the operator' },
+  cross_handle_session: { status: 409, message: 'that session belongs to another handle' },
   id_conflict: { status: 409, message: 'this id belongs to a different message' },
   cancelled: { status: 409, message: 'cancelled' },
   busy: { status: 429, message: 'another message for this chat is still awaiting delivery' },
@@ -69,6 +76,9 @@ export const GATEWAY_ERRORS = {
   shutting_down: { status: 503, message: 'The app is shutting down' },
   queue_full: { status: 503, message: 'The message queue is full' },
   models_not_ready: { status: 503, message: 'the model catalog is not ready yet' },
+  handle_not_ready: { status: 503, message: 'this handle is not proven ready by live browser evidence' },
+  handle_unavailable: { status: 503, message: 'no handle in the pool can serve this model right now' },
+  handle_registry_invalid: { status: 503, message: 'the handle registry is invalid; this instance refuses to serve' },
   gateway_unconfigured: { status: 503, message: 'GATEWAY_API_KEY is not set; the gateway refuses all /v1/* traffic' },
   turn_timeout: { status: 504, message: 'the turn did not finish in time; it keeps running, retry to re-attach' }
 } as const satisfies Record<string, GatewayErrorSpec>;
